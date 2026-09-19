@@ -51,8 +51,10 @@ import {
   createChallenge,
   createIpRateLimiter,
   createMcpRequestLifecycleMiddleware,
+  createMcpTransportObservationMiddleware,
   createOriginMiddleware,
   createSubjectRateLimiter,
+  isMcpInitializeRequest,
   isToolCall,
   type AuthenticatedRequest,
 } from "./http/mcp-middleware.js";
@@ -167,6 +169,7 @@ export function createGatewayApplication(
       limit: config.agent.maxPayloadBytes,
       type: ["application/json", "application/*+json"],
     }),
+    createMcpTransportObservationMiddleware(logger, config.mcpSessionMode),
   ];
 
   if (config.authMode === "oauth") {
@@ -684,15 +687,6 @@ function bindMcpHttpRequestAbort(
       response.removeListener("close", onClose);
     },
   };
-}
-
-function isMcpInitializeRequest(body: unknown): boolean {
-  return (
-    typeof body === "object" &&
-    body !== null &&
-    !Array.isArray(body) &&
-    (body as { method?: unknown }).method === "initialize"
-  );
 }
 
 function isCancellationOnlyMcpBody(body: unknown): boolean {
