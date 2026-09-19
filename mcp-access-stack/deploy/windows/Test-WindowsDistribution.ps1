@@ -218,6 +218,11 @@ Assert-ContainsAll -Label 'Windows detached cutover broker' -Source $broker -Tok
     'PreviousConnectorInstanceId',
     'executionPlaneReady',
     'contractCompatible',
+    "failureStage = 'post-cutover-health'",
+    "failureCode = 'CUTOVER_POST_HEALTH_FAILED'",
+    'rollbackAttempted = $true',
+    "'not-attempted'",
+    'rollbackRestoredReleaseId = [string]$rollbackResult.activeReleaseId',
     "status = 'passed'"
 )
 $edgeInstallIndex = $broker.IndexOf('$edgeTaskResult = & $edgeTaskInstaller @edgeParameters | ConvertFrom-Json')
