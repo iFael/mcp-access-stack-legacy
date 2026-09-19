@@ -1,5 +1,8 @@
 [CmdletBinding()]
-param()
+param(
+    [ValidateSet('rollback-failure', 'handover-success')]
+    [string]$Scenario = 'rollback-failure'
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -91,12 +94,88 @@ function New-TestRelease {
 
     $candidateSleeper = @'
 [CmdletBinding()]
-param([Parameter(Mandatory = $true)][string]$PidFile)
+param(
+    [Parameter(Mandatory = $true)][string]$PidFile,
+    [Parameter(Mandatory = $true)][string]$HealthStateFile,
+    [Parameter(Mandatory = $true)][string]$ReleaseId,
+    [Parameter(Mandatory = $true)][string]$ConnectorInstanceId,
+    [int]$Port = 0,
+    [switch]$PublishHealth,
+    [switch]$ServeHealth
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 [IO.File]::WriteAllText($PidFile, [string]$PID, [Text.UTF8Encoding]::new($false))
-Start-Sleep -Seconds 300
+$health = [ordered]@{
+    service = 'mcp-edge-gateway'
+    controlPlaneReady = $true
+    executionPlaneReady = $true
+    connectorReady = $true
+    contractCompatible = $true
+    runtime = [ordered]@{
+        connectorInstanceId = $ConnectorInstanceId
+        catalogContractRevision = 'rollback-test-contract'
+        releaseId = $ReleaseId
+    }
+}
+if ($PublishHealth -or $ServeHealth) {
+    [IO.File]::WriteAllText(
+        $HealthStateFile,
+        (($health | ConvertTo-Json -Depth 6 -Compress) + [Environment]::NewLine),
+        [Text.UTF8Encoding]::new($false)
+    )
+}
+if (-not $ServeHealth) {
+    Start-Sleep -Seconds 300
+    return
+}
+
+$listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $Port)
+$started = $false
+for ($attempt = 0; $attempt -lt 30 -and -not $started; $attempt++) {
+    try {
+        $listener.Start()
+        $started = $true
+    }
+    catch {
+        if ($attempt -ge 29) { throw }
+        Start-Sleep -Milliseconds 100
+    }
+}
+$body = $health | ConvertTo-Json -Depth 6 -Compress
+$payload = [Text.Encoding]::UTF8.GetBytes($body)
+$crlf = [string][char]13 + [string][char]10
+$headerTerminator = $crlf + $crlf
+$headers = 'HTTP/1.1 200 OK' + $crlf +
+    'Content-Type: application/json' + $crlf +
+    'Content-Length: ' + $payload.Length + $crlf +
+    'Connection: close' + $crlf + $crlf
+$headerBytes = [Text.Encoding]::ASCII.GetBytes($headers)
+try {
+    while ($true) {
+        $client = $listener.AcceptTcpClient()
+        try {
+            $stream = $client.GetStream()
+            $buffer = [byte[]]::new(4096)
+            $request = ''
+            do {
+                $read = $stream.Read($buffer, 0, $buffer.Length)
+                if ($read -le 0) { break }
+                $request += [Text.Encoding]::ASCII.GetString($buffer, 0, $read)
+            } while ($request.Length -lt 16384 -and -not $request.Contains($headerTerminator))
+            $stream.Write($headerBytes, 0, $headerBytes.Length)
+            $stream.Write($payload, 0, $payload.Length)
+            $stream.Flush()
+        }
+        finally {
+            if ($null -ne $client) { $client.Dispose() }
+        }
+    }
+}
+finally {
+    $listener.Stop()
+}
 '@
     Write-TestUtf8 -Path (Join-Path $windows 'Test-CutoverCandidateSleeper.ps1') -Content $candidateSleeper
 
@@ -134,10 +213,27 @@ if (-not $Execute) { throw 'Test Edge installer requires -Execute.' }
 $releaseRoot = Join-Path $InstallationRoot "releases\$ReleaseId"
 $sleeper = Join-Path $releaseRoot 'deploy\windows\Test-CutoverCandidateSleeper.ps1'
 $pidFile = Join-Path $InstallationRoot 'state\candidate-task.pid'
+$healthStateFile = Join-Path $InstallationRoot 'state\health-state.json'
+$connectorInstanceId = if ($TaskName -like '* handover *') {
+    'rollback-handover-' + $ReleaseId
+}
+else {
+    'rollback-canonical-' + $ReleaseId
+}
 $pwsh = (Get-Command pwsh.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
 $userId = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
-    $sleeper + '" -PidFile "' + $pidFile + '"'
+    $sleeper + '" -PidFile "' + $pidFile +
+    '" -HealthStateFile "' + $healthStateFile +
+    '" -ReleaseId "' + $ReleaseId +
+    '" -ConnectorInstanceId "' + $connectorInstanceId + '"'
+if ($TaskName -like '* handover *') {
+    $arguments += ' -PublishHealth'
+}
+elseif (Test-Path -LiteralPath (Join-Path $InstallationRoot 'state\handover-success.flag')) {
+    $edgeUri = [Uri]$EdgeBaseUrl
+    $arguments += ' -ServeHealth -Port ' + [string]$edgeUri.Port
+}
 $action = New-ScheduledTaskAction -Execute $pwsh -Argument $arguments -WorkingDirectory $releaseRoot
 $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
@@ -268,7 +364,8 @@ function Register-TestPreviousTask {
         [Parameter(Mandatory = $true)][string]$ReleaseId,
         [Parameter(Mandatory = $true)][string]$ConnectorInstanceId,
         [Parameter(Mandatory = $true)][string]$PidFile,
-        [Parameter(Mandatory = $true)][string]$LogFile
+        [Parameter(Mandatory = $true)][string]$LogFile,
+        [Parameter(Mandatory = $true)][string]$HealthStateFile
     )
 
     $pwsh = (Get-Command pwsh.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
@@ -278,7 +375,8 @@ function Register-TestPreviousTask {
         ' -ReleaseId "' + $ReleaseId +
         '" -ConnectorInstanceId "' + $ConnectorInstanceId +
         '" -PidFile "' + $PidFile +
-        '" -LogFile "' + $LogFile + '"'
+        '" -LogFile "' + $LogFile +
+        '" -HealthStateFile "' + $HealthStateFile + '"'
     $action = New-ScheduledTaskAction -Execute $pwsh -Argument $arguments -WorkingDirectory $WorkingDirectory
     $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
@@ -306,9 +404,12 @@ $brokerTaskName = "MCP Access Stack rollback-broker-$suffix"
 $previousReleaseId = "rollback-prev-$suffix"
 $candidateReleaseId = "rollback-bad-$suffix"
 $previousConnectorInstanceId = "rollback-prev-instance-$suffix"
+$handoverConnectorInstanceId = "rollback-handover-$candidateReleaseId"
+$canonicalConnectorInstanceId = "rollback-canonical-$candidateReleaseId"
 $previousPidFile = Join-Path $stateRoot 'previous-task.pid'
 $previousLogFile = Join-Path $stateRoot 'previous-task.log'
 $candidatePidFile = Join-Path $stateRoot 'candidate-task.pid'
+$healthStateFile = Join-Path $stateRoot 'health-state.json'
 $port = Get-TestFreeTcpPort
 $edgeBaseUrl = "http://127.0.0.1:$port"
 $healthUrl = "$edgeBaseUrl/health"
@@ -320,7 +421,8 @@ param(
     [Parameter(Mandatory = $true)][string]$ReleaseId,
     [Parameter(Mandatory = $true)][string]$ConnectorInstanceId,
     [Parameter(Mandatory = $true)][string]$PidFile,
-    [Parameter(Mandatory = $true)][string]$LogFile
+    [Parameter(Mandatory = $true)][string]$LogFile,
+    [Parameter(Mandatory = $true)][string]$HealthStateFile
 )
 
 Set-StrictMode -Version Latest
@@ -338,7 +440,7 @@ function Write-ServerLog {
 [IO.File]::WriteAllText($PidFile, [string]$PID, [Text.UTF8Encoding]::new($false))
 Write-ServerLog -Message ('started pid=' + [string]$PID + ' port=' + [string]$Port)
 
-$body = [ordered]@{
+$initialHealth = [ordered]@{
     service = 'mcp-edge-gateway'
     controlPlaneReady = $true
     executionPlaneReady = $true
@@ -349,15 +451,14 @@ $body = [ordered]@{
         catalogContractRevision = 'rollback-test-contract'
         releaseId = $ReleaseId
     }
-} | ConvertTo-Json -Depth 6 -Compress
-$payload = [Text.Encoding]::UTF8.GetBytes($body)
+}
+[IO.File]::WriteAllText(
+    $HealthStateFile,
+    (($initialHealth | ConvertTo-Json -Depth 6 -Compress) + [Environment]::NewLine),
+    [Text.UTF8Encoding]::new($false)
+)
 $crlf = [string][char]13 + [string][char]10
 $headerTerminator = $crlf + $crlf
-$headers = 'HTTP/1.1 200 OK' + $crlf +
-    'Content-Type: application/json' + $crlf +
-    'Content-Length: ' + $payload.Length + $crlf +
-    'Connection: close' + $crlf + $crlf
-$headerBytes = [Text.Encoding]::ASCII.GetBytes($headers)
 
 $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $Port)
 $listener.Start()
@@ -376,6 +477,13 @@ try {
                 $request += [Text.Encoding]::ASCII.GetString($buffer, 0, $read)
             } while ($request.Length -lt 16384 -and -not $request.Contains($headerTerminator))
 
+            $body = (Get-Content -LiteralPath $HealthStateFile -Raw).Trim()
+            $payload = [Text.Encoding]::UTF8.GetBytes($body)
+            $headers = 'HTTP/1.1 200 OK' + $crlf +
+                'Content-Type: application/json' + $crlf +
+                'Content-Length: ' + $payload.Length + $crlf +
+                'Connection: close' + $crlf + $crlf
+            $headerBytes = [Text.Encoding]::ASCII.GetBytes($headers)
             $stream.Write($headerBytes, 0, $headerBytes.Length)
             $stream.Write($payload, 0, $payload.Length)
             $stream.Flush()
@@ -439,10 +547,13 @@ try {
     Write-TestUtf8 -Path $connectorToken -Content 'rollback-test-connector-token'
     Write-TestUtf8 -Path $ownerToken -Content 'rollback-test-owner-token'
     Write-TestUtf8 -Path $policyPath -Content '{}'
+    if ($Scenario -eq 'handover-success') {
+        Write-TestUtf8 -Path (Join-Path $stateRoot 'handover-success.flag') -Content 'enabled'
+    }
 
     $serverPath = Join-Path $testRoot 'previous-health-server.ps1'
     Write-TestUtf8 -Path $serverPath -Content $serverScript
-    $previousTask = Register-TestPreviousTask -TaskName $edgeTaskName -ServerScript $serverPath -WorkingDirectory $testRoot -Port $port -ReleaseId $previousReleaseId -ConnectorInstanceId $previousConnectorInstanceId -PidFile $previousPidFile -LogFile $previousLogFile
+    $previousTask = Register-TestPreviousTask -TaskName $edgeTaskName -ServerScript $serverPath -WorkingDirectory $testRoot -Port $port -ReleaseId $previousReleaseId -ConnectorInstanceId $previousConnectorInstanceId -PidFile $previousPidFile -LogFile $previousLogFile -HealthStateFile $healthStateFile
 
     try {
         $healthBefore = Wait-TestHealth -Uri $healthUrl
@@ -549,15 +660,60 @@ try {
     )
     $brokerOutput = (& $pwsh @brokerArgs 2>&1 | Out-String).Trim()
     $brokerExitCode = $LASTEXITCODE
-    if ($brokerExitCode -eq 0) {
-        throw 'Broker unexpectedly succeeded despite the deliberately unavailable candidate health endpoint.'
-    }
-
     $resultPath = Join-Path $stateRoot "access-stack-cutover-runs\$requestId\result.json"
     if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
-        throw 'Broker failure did not persist result.json.'
+        throw 'Broker completion did not persist result.json.'
     }
     $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+
+    if ($Scenario -eq 'handover-success') {
+        if ($brokerExitCode -ne 0 -or [string]$result.status -ne 'passed') {
+            throw "Broker handover success scenario failed. exitCode=$brokerExitCode result=$($result | ConvertTo-Json -Depth 8 -Compress) output=$brokerOutput"
+        }
+        if ([string]$result.healthGate.connectorInstanceId -ne $canonicalConnectorInstanceId) {
+            throw "Canonical connector did not become final owner: $($result.healthGate.connectorInstanceId)"
+        }
+
+        $stateAfterSuccess = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+        if ([string]$stateAfterSuccess.active.releaseId -ne $candidateReleaseId -or
+            $null -ne $stateAfterSuccess.candidate -or
+            [string]$stateAfterSuccess.previous.releaseId -ne $previousReleaseId) {
+            throw 'Successful handover lifecycle state is inconsistent.'
+        }
+
+        $handoverTasksAfterSuccess = @(Get-ScheduledTask -TaskName ($edgeTaskName + ' handover *') -ErrorAction SilentlyContinue)
+        if ($handoverTasksAfterSuccess.Count -ne 0) {
+            throw "Handover Scheduled Task remained after successful cutover: $($handoverTasksAfterSuccess.TaskName -join ', ')"
+        }
+        $canonicalTask = Get-ScheduledTask -TaskName $edgeTaskName -ErrorAction Stop
+        if ([string]$canonicalTask.State -ne 'Running') {
+            throw "Canonical candidate task is not Running after successful handover: $($canonicalTask.State)"
+        }
+        $healthAfterSuccess = Wait-TestHealth -Uri $healthUrl
+        if ([string]$healthAfterSuccess.runtime.connectorInstanceId -ne $canonicalConnectorInstanceId -or
+            [string]$healthAfterSuccess.runtime.releaseId -ne $candidateReleaseId) {
+            throw 'Canonical candidate did not answer health after successful handover.'
+        }
+
+        [pscustomobject]@{
+            status = 'passed'
+            scenario = 'zero-gap-handover-success'
+            brokerExitCode = $brokerExitCode
+            resultStatus = [string]$result.status
+            handoverConnectorInstanceId = $handoverConnectorInstanceId
+            canonicalConnectorInstanceId = [string]$result.healthGate.connectorInstanceId
+            activeReleaseId = [string]$stateAfterSuccess.active.releaseId
+            previousReleaseId = [string]$stateAfterSuccess.previous.releaseId
+            handoverTaskRemoved = $true
+            canonicalTaskRunning = $true
+            canonicalHealthResponding = $true
+        } | ConvertTo-Json -Depth 8
+        return
+    }
+
+    if ($brokerExitCode -eq 0) {
+        throw 'Broker unexpectedly succeeded despite the deliberately unavailable canonical candidate health endpoint.'
+    }
     if ([string]$result.status -ne 'failed') {
         throw "Broker failure result must be failed, got: $($result.status)"
     }
@@ -643,6 +799,19 @@ try {
     if ($candidatePid -and (Get-Process -Id $candidatePid -ErrorAction SilentlyContinue)) {
         throw "Candidate Scheduled Task process remained orphaned after rollback: PID=$candidatePid"
     }
+    $handoverTasksAfter = @(Get-ScheduledTask -TaskName ($edgeTaskName + ' handover *') -ErrorAction SilentlyContinue)
+    if ($handoverTasksAfter.Count -ne 0) {
+        throw "Handover Scheduled Task remained after rollback: $($handoverTasksAfter.TaskName -join ', ')"
+    }
+    $candidateProcessesAfter = @(
+        Get-CimInstance Win32_Process |
+            Where-Object {
+                [string]$_.CommandLine -like ('*' + $testRoot + '*Test-CutoverCandidateSleeper.ps1*')
+            }
+    )
+    if ($candidateProcessesAfter.Count -ne 0) {
+        throw "Candidate process remained after rollback: $($candidateProcessesAfter.ProcessId -join ', ')"
+    }
     if (Test-Path -LiteralPath $requestPath) {
         throw 'Consumed cutover request remained pending after broker completion.'
     }
@@ -669,6 +838,24 @@ try {
     } | ConvertTo-Json -Depth 8
 }
 finally {
+    $handoverTasks = @(Get-ScheduledTask -TaskName ($edgeTaskName + ' handover *') -ErrorAction SilentlyContinue)
+    foreach ($handoverTask in $handoverTasks) {
+        if ([string]$handoverTask.State -eq 'Running') {
+            Stop-ScheduledTask -TaskName ([string]$handoverTask.TaskName) -ErrorAction SilentlyContinue
+        }
+        Unregister-ScheduledTask -TaskName ([string]$handoverTask.TaskName) -Confirm:$false -ErrorAction SilentlyContinue
+    }
+
+    $candidateProcesses = @(
+        Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object {
+                [string]$_.CommandLine -like ('*' + $testRoot + '*Test-CutoverCandidateSleeper.ps1*')
+            }
+    )
+    foreach ($candidateProcess in $candidateProcesses) {
+        Stop-Process -Id ([int]$candidateProcess.ProcessId) -Force -ErrorAction SilentlyContinue
+    }
+
     $task = Get-ScheduledTask -TaskName $edgeTaskName -ErrorAction SilentlyContinue
     if ($task) {
         if ([string]$task.State -eq 'Running') {
