@@ -217,7 +217,7 @@ export class McpSession extends DurableObject<EdgeGatewayEnv> {
         ...(runtime === undefined ? {} : { connectionGeneration: runtime.connectionGeneration }),
         ...(runtime === undefined ? {} : { runtime }),
       } satisfies ConnectorAttachment);
-      const selected = this.getExecutionReadyConnector(attachment.protocolVersion);
+      const selected = this.getPreferredExecutionReadyConnector();
       if (selected === webSocket) {
         this.updateConnectorTelemetry({
           type: "ready",
