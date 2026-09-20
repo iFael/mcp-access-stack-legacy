@@ -1,7 +1,15 @@
+import { randomUUID } from "node:crypto";
 import { readFile as readLocalFile, writeFile as writeLocalFile } from "node:fs/promises";
 import path from "node:path";
 import {
   AppError,
+  assertTypedGitBranchMutationAllowed,
+  gitCommitInputSchema,
+  gitCreateBranchInputSchema,
+  gitMergeBranchInputSchema,
+  gitPushBranchInputSchema,
+  gitStagePathsInputSchema,
+  gitUnstagePathsInputSchema,
   mandatoryBlockedGlobs,
   policyFileSchema,
   readBackgroundTaskOutputInputSchema,
@@ -18,6 +26,18 @@ import {
   type WaitBackgroundTaskInput,
   type GetWorkspaceContextInput,
   type GetWorkspaceContextResult,
+  type GitCommitInput,
+  type GitCommitResult,
+  type GitCreateBranchInput,
+  type GitCreateBranchResult,
+  type GitMergeBranchInput,
+  type GitMergeBranchResult,
+  type GitPushBranchInput,
+  type GitPushBranchResult,
+  type GitStagePathsInput,
+  type GitStagePathsResult,
+  type GitUnstagePathsInput,
+  type GitUnstagePathsResult,
   type InspectGitInput,
   type InspectGitResult,
   type ListBackgroundTasksInput,
@@ -70,6 +90,7 @@ import { CommandConfirmationRegistry } from "../shell/confirmation.js";
 import { BackgroundTaskManager } from "../tasks/background-task-manager.js";
 import {
   SshWindowsTransport,
+  type RemoteProcessResult,
   type SshWindowsTransportConfig,
 } from "./ssh-windows-transport.js";
 
@@ -81,6 +102,11 @@ const IMPLICIT_OPERATIONAL_DIRECTORIES = new Set([
 
 interface RemoteWorkspace extends WorkspacePolicy {
   blockedGlobs: string[];
+}
+
+interface RemoteGitRepositoryContext {
+  workspace: RemoteWorkspace;
+  logicalRoot: string;
 }
 
 export interface SshWorkspaceExecutorOptions {
@@ -932,23 +958,513 @@ export class SshWorkspaceExecutor implements WorkspaceExecutor, GitRepositoryExe
     );
   }
 
-  createBranch(..._args: Parameters<GitRepositoryExecutor["createBranch"]>): ReturnType<GitRepositoryExecutor["createBranch"]> {
-    return Promise.reject(this.sourceControlUnsupported("createBranch"));
+  async createBranch(
+    input: GitCreateBranchInput,
+    context: OperationContext = {},
+  ): Promise<GitCreateBranchResult> {
+    const parsed = gitCreateBranchInputSchema.parse(input);
+    const repository = await this.resolveGitRepository(
+      parsed.workspaceId,
+      parsed.root ?? ".",
+      context.signal,
+    );
+    const actualHead = await this.gitHeadSha(repository, context.signal);
+    assertGitSha(
+      "GIT_HEAD_MISMATCH",
+      parsed.expectedHeadSha,
+      actualHead,
+      "Git HEAD changed before branch creation.",
+    );
+    if ((await this.gitBranchSha(repository, parsed.branch, context.signal)) !== undefined) {
+      throw new AppError("GIT_BRANCH_CONFLICT", "Git branch already exists.");
+    }
+    await this.gitSuccess(
+      repository,
+      this.gitMutationArgs(repository.workspace, [
+        "switch",
+        "-c",
+        parsed.branch,
+        parsed.expectedHeadSha,
+      ]),
+      context.signal,
+    );
+    const headSha = await this.gitHeadSha(repository, context.signal);
+    assertGitSha(
+      "GIT_HEAD_MISMATCH",
+      parsed.expectedHeadSha,
+      headSha,
+      "Git branch creation produced an unexpected HEAD.",
+    );
+    return { root: repository.logicalRoot, branch: parsed.branch, headSha };
   }
-  stagePaths(..._args: Parameters<GitRepositoryExecutor["stagePaths"]>): ReturnType<GitRepositoryExecutor["stagePaths"]> {
-    return Promise.reject(this.sourceControlUnsupported("stagePaths"));
+
+  async stagePaths(
+    input: GitStagePathsInput,
+    context: OperationContext = {},
+  ): Promise<GitStagePathsResult> {
+    const parsed = gitStagePathsInputSchema.parse(input);
+    const repository = await this.resolveGitRepository(
+      parsed.workspaceId,
+      parsed.root ?? ".",
+      context.signal,
+    );
+    const paths = this.authorizeGitPaths(repository, parsed.paths);
+    await this.gitSuccess(
+      repository,
+      this.gitMutationArgs(repository.workspace, ["add", "--", ...paths]),
+      context.signal,
+    );
+    return {
+      root: repository.logicalRoot,
+      headSha: await this.gitHeadSha(repository, context.signal),
+      indexTreeSha: await this.gitWriteTree(repository, context.signal),
+      paths,
+    };
   }
-  unstagePaths(..._args: Parameters<GitRepositoryExecutor["unstagePaths"]>): ReturnType<GitRepositoryExecutor["unstagePaths"]> {
-    return Promise.reject(this.sourceControlUnsupported("unstagePaths"));
+
+  async unstagePaths(
+    input: GitUnstagePathsInput,
+    context: OperationContext = {},
+  ): Promise<GitUnstagePathsResult> {
+    const parsed = gitUnstagePathsInputSchema.parse(input);
+    const repository = await this.resolveGitRepository(
+      parsed.workspaceId,
+      parsed.root ?? ".",
+      context.signal,
+    );
+    const actualHead = await this.gitHeadSha(repository, context.signal);
+    assertGitSha(
+      "GIT_HEAD_MISMATCH",
+      parsed.expectedHeadSha,
+      actualHead,
+      "Git HEAD changed before unstage.",
+    );
+    const actualIndex = await this.gitWriteTree(repository, context.signal);
+    assertGitSha(
+      "GIT_INDEX_CHANGED",
+      parsed.expectedIndexTreeSha,
+      actualIndex,
+      "Git index changed before unstage.",
+    );
+    const paths = this.authorizeGitPaths(repository, parsed.paths);
+    await this.gitSuccess(
+      repository,
+      this.gitMutationArgs(repository.workspace, ["restore", "--staged", "--", ...paths]),
+      context.signal,
+    );
+    return {
+      root: repository.logicalRoot,
+      headSha: await this.gitHeadSha(repository, context.signal),
+      indexTreeSha: await this.gitWriteTree(repository, context.signal),
+      paths,
+    };
   }
-  commit(..._args: Parameters<GitRepositoryExecutor["commit"]>): ReturnType<GitRepositoryExecutor["commit"]> {
-    return Promise.reject(this.sourceControlUnsupported("commit"));
+
+  async commit(
+    input: GitCommitInput,
+    context: OperationContext = {},
+  ): Promise<GitCommitResult> {
+    const parsed = gitCommitInputSchema.parse(input);
+    const repository = await this.resolveGitRepository(
+      parsed.workspaceId,
+      parsed.root ?? ".",
+      context.signal,
+    );
+    const branch = await this.gitCurrentBranch(repository, context.signal);
+    assertTypedGitBranchMutationAllowed({ operation: "git_commit", currentBranch: branch });
+    const actualHead = await this.gitHeadSha(repository, context.signal);
+    assertGitSha(
+      "GIT_HEAD_MISMATCH",
+      parsed.expectedHeadSha,
+      actualHead,
+      "Git HEAD changed before commit.",
+    );
+    const actualIndex = await this.gitWriteTree(repository, context.signal);
+    assertGitSha(
+      "GIT_INDEX_CHANGED",
+      parsed.expectedIndexTreeSha,
+      actualIndex,
+      "Git index changed before commit.",
+    );
+    await this.gitSuccess(
+      repository,
+      this.gitMutationArgs(repository.workspace, ["commit", "-m", parsed.message]),
+      context.signal,
+    );
+    return {
+      root: repository.logicalRoot,
+      branch,
+      commitSha: await this.gitHeadSha(repository, context.signal),
+    };
   }
-  mergeBranch(..._args: Parameters<GitRepositoryExecutor["mergeBranch"]>): ReturnType<GitRepositoryExecutor["mergeBranch"]> {
-    return Promise.reject(this.sourceControlUnsupported("mergeBranch"));
+
+  async mergeBranch(
+    input: GitMergeBranchInput,
+    context: OperationContext = {},
+  ): Promise<GitMergeBranchResult> {
+    const parsed = gitMergeBranchInputSchema.parse(input);
+    const repository = await this.resolveGitRepository(
+      parsed.workspaceId,
+      parsed.root ?? ".",
+      context.signal,
+    );
+    const branch = await this.gitCurrentBranch(repository, context.signal);
+    assertTypedGitBranchMutationAllowed({
+      operation: "git_merge_branch",
+      currentBranch: branch,
+    });
+    const targetHead = await this.gitHeadSha(repository, context.signal);
+    assertGitSha(
+      "GIT_HEAD_MISMATCH",
+      parsed.expectedTargetHeadSha,
+      targetHead,
+      "Git target HEAD changed before merge.",
+    );
+    const sourceHead = await this.gitBranchSha(
+      repository,
+      parsed.sourceBranch,
+      context.signal,
+    );
+    if (sourceHead === undefined || sourceHead !== parsed.expectedSourceHeadSha) {
+      throw new AppError("GIT_HEAD_MISMATCH", "Git source branch changed before merge.");
+    }
+    if (
+      !(await this.gitIsClean(repository, ["diff", "--cached", "--quiet"], context.signal)) ||
+      !(await this.gitIsClean(repository, ["diff", "--quiet"], context.signal))
+    ) {
+      throw new AppError(
+        "GIT_MERGE_NOT_FAST_FORWARD",
+        "Git repository must have a clean index and worktree before merge.",
+      );
+    }
+    if (
+      !(await this.gitIsClean(
+        repository,
+        ["merge-base", "--is-ancestor", targetHead, sourceHead],
+        context.signal,
+      ))
+    ) {
+      throw new AppError(
+        "GIT_MERGE_NOT_FAST_FORWARD",
+        "Git source branch cannot fast-forward the current branch.",
+      );
+    }
+    await this.gitSuccess(
+      repository,
+      this.gitMutationArgs(repository.workspace, ["merge", "--ff-only", sourceHead]),
+      context.signal,
+    );
+    const headSha = await this.gitHeadSha(repository, context.signal);
+    if (headSha !== sourceHead) {
+      throw new AppError(
+        "SOURCE_CONTROL_RECONCILIATION_REQUIRED",
+        "Git merge completed with an unexpected repository state.",
+      );
+    }
+    return {
+      root: repository.logicalRoot,
+      branch,
+      previousHeadSha: targetHead,
+      headSha,
+      sourceHeadSha: sourceHead,
+      fastForwarded: true,
+    };
   }
-  pushBranch(..._args: Parameters<GitRepositoryExecutor["pushBranch"]>): ReturnType<GitRepositoryExecutor["pushBranch"]> {
-    return Promise.reject(this.sourceControlUnsupported("pushBranch"));
+
+  async pushBranch(
+    input: GitPushBranchInput,
+    context: OperationContext = {},
+  ): Promise<GitPushBranchResult> {
+    const parsed = gitPushBranchInputSchema.parse(input);
+    assertTypedGitBranchMutationAllowed({
+      operation: "git_push_branch",
+      branch: parsed.branch,
+    });
+    const repository = await this.resolveGitRepository(
+      parsed.workspaceId,
+      parsed.root ?? ".",
+      context.signal,
+    );
+    const localSha = await this.gitBranchSha(repository, parsed.branch, context.signal);
+    if (localSha === undefined || localSha !== parsed.expectedLocalSha) {
+      throw new AppError("GIT_HEAD_MISMATCH", "Git branch changed before push.");
+    }
+    const remoteSha = await this.gitRemoteBranchSha(
+      repository,
+      parsed.remote,
+      parsed.branch,
+      context.signal,
+    );
+    if (parsed.expectedRemoteSha !== undefined && remoteSha !== parsed.expectedRemoteSha) {
+      throw new AppError("GIT_REMOTE_CHANGED", "Git remote branch changed before push.");
+    }
+
+    try {
+      await this.gitSuccess(
+        repository,
+        this.gitMutationArgs(repository.workspace, [
+          "push",
+          parsed.remote,
+          `${localSha}:refs/heads/${parsed.branch}`,
+        ]),
+        context.signal,
+        120_000,
+      );
+    } catch (error) {
+      if (error instanceof AppError && error.code === "OPERATION_CANCELLED") throw error;
+      return this.reconcileGitPush(
+        repository,
+        parsed.remote,
+        parsed.branch,
+        localSha,
+        context.signal,
+      );
+    }
+    return this.reconcileGitPush(
+      repository,
+      parsed.remote,
+      parsed.branch,
+      localSha,
+      context.signal,
+    );
+  }
+
+  private async resolveGitRepository(
+    workspaceId: string,
+    root: string,
+    signal?: AbortSignal,
+  ): Promise<RemoteGitRepositoryContext> {
+    const workspace = this.workspace(workspaceId);
+    this.assertWritesEnabled(workspace);
+    const logicalRoot = this.authorizeGitRoot(workspace, root);
+    const inside = await this.gitInvoke(
+      { workspace, logicalRoot },
+      ["rev-parse", "--is-inside-work-tree"],
+      [0, 128],
+      signal,
+    );
+    if (inside.exitCode !== 0 || inside.stdout.trim() !== "true") {
+      throw new AppError(
+        "NOT_GIT_REPOSITORY",
+        "The selected workspace root is not inside a Git worktree.",
+      );
+    }
+
+    let topLevel: string;
+    try {
+      topLevel = (
+        await this.gitSuccess(
+          { workspace, logicalRoot },
+          ["rev-parse", "--show-toplevel"],
+          signal,
+        )
+      ).trim();
+    } catch (error) {
+      if (!(error instanceof AppError) || error.code !== "GIT_ERROR") throw error;
+      throw new AppError(
+        "NOT_GIT_REPOSITORY",
+        "Unable to resolve the selected Git repository.",
+      );
+    }
+    const expectedTopLevel = logicalRoot === "."
+      ? path.win32.normalize(workspace.rootPath)
+      : path.win32.normalize(path.win32.join(workspace.rootPath, ...logicalRoot.split("/")));
+    if (!sameWindowsPath(topLevel, expectedTopLevel)) {
+      throw new AppError(
+        "NOT_GIT_REPOSITORY",
+        "Git mutations require the selected authorized root to be the repository top-level.",
+      );
+    }
+    return { workspace, logicalRoot };
+  }
+
+  private authorizeGitRoot(workspace: RemoteWorkspace, value: string): string {
+    const logical = normalizeRelativePath(value, true);
+    if (this.isBlocked(workspace, logical)) {
+      throw new AppError("BLOCKED_PATH", "Path is blocked by workspace policy.");
+    }
+    const authorized = workspace.allowedRoots.some((allowedRoot) => {
+      const allowed = normalizeRelativePath(allowedRoot, true);
+      return logicalContains(allowed, logical) || logicalContains(logical, allowed);
+    });
+    if (!authorized) {
+      throw new AppError(
+        "PATH_OUTSIDE_ALLOWED_ROOTS",
+        "Git root must be an allowed path or an ancestor of an allowed root.",
+      );
+    }
+    return logical;
+  }
+
+  private authorizeGitPaths(
+    repository: RemoteGitRepositoryContext,
+    paths: readonly string[],
+  ): string[] {
+    return paths.map((candidate) => {
+      const normalized = normalizeRelativePath(candidate, false);
+      this.authorizeWrite(
+        repository.workspace,
+        joinLogical(repository.logicalRoot, normalized),
+      );
+      return normalized;
+    });
+  }
+
+  private async gitInvoke(
+    repository: RemoteGitRepositoryContext,
+    args: readonly string[],
+    acceptedExitCodes: readonly number[] = [0],
+    signal?: AbortSignal,
+    timeoutMs = 60_000,
+  ): Promise<RemoteProcessResult> {
+    const result = await this.transport.exec(
+      repository.workspace.rootPath,
+      repository.logicalRoot,
+      "git",
+      args,
+      timeoutMs,
+      signal,
+    );
+    if (
+      result.timedOut ||
+      result.exitCode === null ||
+      !acceptedExitCodes.includes(result.exitCode)
+    ) {
+      throw new AppError("GIT_ERROR", "Git command failed.");
+    }
+    return result;
+  }
+
+  private async gitSuccess(
+    repository: RemoteGitRepositoryContext,
+    args: readonly string[],
+    signal?: AbortSignal,
+    timeoutMs = 60_000,
+  ): Promise<string> {
+    return (await this.gitInvoke(repository, args, [0], signal, timeoutMs)).stdout;
+  }
+
+  private async gitHeadSha(
+    repository: RemoteGitRepositoryContext,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    return parseGitSha(
+      (
+        await this.gitSuccess(repository, ["rev-parse", "HEAD"], signal)
+      ).trim(),
+    );
+  }
+
+  private async gitCurrentBranch(
+    repository: RemoteGitRepositoryContext,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    return (
+      await this.gitSuccess(
+        repository,
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        signal,
+      )
+    ).trim();
+  }
+
+  private async gitBranchSha(
+    repository: RemoteGitRepositoryContext,
+    branch: string,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> {
+    const result = await this.gitInvoke(
+      repository,
+      ["rev-parse", "--verify", `refs/heads/${branch}`],
+      [0, 128],
+      signal,
+    );
+    return result.exitCode === 0 ? parseGitSha(result.stdout.trim()) : undefined;
+  }
+
+  private async gitWriteTree(
+    repository: RemoteGitRepositoryContext,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    return parseGitSha(
+      (await this.gitSuccess(repository, ["write-tree"], signal)).trim(),
+    );
+  }
+
+  private async gitIsClean(
+    repository: RemoteGitRepositoryContext,
+    args: readonly string[],
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    return (await this.gitInvoke(repository, args, [0, 1], signal)).exitCode === 0;
+  }
+
+  private async gitRemoteBranchSha(
+    repository: RemoteGitRepositoryContext,
+    remote: string,
+    branch: string,
+    signal?: AbortSignal,
+  ): Promise<string | undefined> {
+    const output = (
+      await this.gitSuccess(
+        repository,
+        ["ls-remote", "--heads", remote, branch],
+        signal,
+        120_000,
+      )
+    ).trim();
+    if (output.length === 0) return undefined;
+    const [sha] = output.split(/\s+/u);
+    return sha === undefined ? undefined : parseGitSha(sha);
+  }
+
+  private async reconcileGitPush(
+    repository: RemoteGitRepositoryContext,
+    remote: string,
+    branch: string,
+    localSha: string,
+    signal?: AbortSignal,
+  ): Promise<GitPushBranchResult> {
+    const reconciledRemoteSha = await this.gitRemoteBranchSha(
+      repository,
+      remote,
+      branch,
+      signal,
+    );
+    if (reconciledRemoteSha !== localSha) {
+      throw new AppError(
+        "SOURCE_CONTROL_RECONCILIATION_REQUIRED",
+        "Git push outcome requires reconciliation.",
+      );
+    }
+    return {
+      status: "completed",
+      root: repository.logicalRoot,
+      remote,
+      branch,
+      localSha,
+      remoteSha: reconciledRemoteSha,
+    };
+  }
+
+  private gitMutationArgs(
+    workspace: RemoteWorkspace,
+    args: readonly string[],
+  ): readonly string[] {
+    const disabledHooksPath = path.win32.join(
+      workspace.rootPath,
+      ".runtime-tools",
+      `.mcp-git-disabled-hooks-${randomUUID()}`,
+    );
+    return [
+      "-c",
+      `core.hooksPath=${disabledHooksPath}`,
+      "-c",
+      "commit.gpgSign=false",
+      "-c",
+      "merge.gpgSign=false",
+      ...args,
+    ];
   }
   getRepository(..._args: Parameters<GitHubExecutor["getRepository"]>): ReturnType<GitHubExecutor["getRepository"]> {
     return Promise.reject(this.sourceControlUnsupported("getRepository"));
@@ -972,6 +1488,27 @@ export class SshWorkspaceExecutor implements WorkspaceExecutor, GitRepositoryExe
       `Typed source-control operation is not supported by the SSH workspace executor (${operation}).`,
     );
   }
+}
+
+function assertGitSha(
+  code: "GIT_HEAD_MISMATCH" | "GIT_INDEX_CHANGED",
+  expected: string,
+  actual: string,
+  message: string,
+): void {
+  if (expected !== actual) throw new AppError(code, message);
+}
+
+function parseGitSha(value: string): string {
+  if (!/^[a-f0-9]{40}$/iu.test(value)) {
+    throw new AppError("GIT_ERROR", "Git returned an invalid object id.");
+  }
+  return value.toLocaleLowerCase("en-US");
+}
+
+function sameWindowsPath(left: string, right: string): boolean {
+  return path.win32.normalize(left).toLocaleLowerCase("en-US") ===
+    path.win32.normalize(right).toLocaleLowerCase("en-US");
 }
 
 function requirePolicyPath(value: string | undefined): string {

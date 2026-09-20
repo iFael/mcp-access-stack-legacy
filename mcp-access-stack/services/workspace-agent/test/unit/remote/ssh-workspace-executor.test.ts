@@ -12,12 +12,35 @@ import type {
   SshWindowsTransport,
 } from "../../../src/remote/ssh-windows-transport.js";
 
+const SHA_A = "a".repeat(40);
+const SHA_B = "b".repeat(40);
+const SHA_C = "c".repeat(40);
+const SHA_D = "d".repeat(40);
+
+function remoteResult(
+  stdout = "",
+  exitCode: number | null = 0,
+): RemoteProcessResult {
+  return { exitCode, stdout, stderr: "", timedOut: false };
+}
+
+function queueRepository(
+  transport: FakeTransport,
+  topLevel = "C:/workspace",
+): void {
+  transport.execResults.push(
+    remoteResult("true\n"),
+    remoteResult(`${topLevel}\n`),
+  );
+}
+
 class FakeTransport {
   readonly files = new Map<string, Buffer>([
     ["README.md", Buffer.from("line one\nline two\n", "utf8")],
   ]);
   commands: Array<{ shell: string; command: string; cwd: string }> = [];
   execCommands: Array<{ executable: string; argv: string[]; cwd: string }> = [];
+  execResults: RemoteProcessResult[] = [];
 
   async probeRoot() {
     return { fullPath: "C:\\workspace", kind: "directory" as const };
@@ -70,7 +93,7 @@ class FakeTransport {
 
   async exec(_root: string, cwd: string, executable: string, argv: string[]): Promise<RemoteProcessResult> {
     this.execCommands.push({ executable, argv, cwd });
-    return { exitCode: 0, stdout: "main\n", stderr: "", timedOut: false };
+    return this.execResults.shift() ?? remoteResult("main\n");
   }
 }
 
@@ -285,14 +308,254 @@ describe("SshWorkspaceExecutor", () => {
     );
   });
 
-  it("fails closed for every typed source-control port without touching the SSH transport", async () => {
-    const methods = [
-      "createBranch",
-      "stagePaths",
-      "unstagePaths",
+  it("requires the selected remote root to be the Git top-level", async () => {
+    queueRepository(transport, "C:/parent");
+
+    await expect(
+      executor.stagePaths({
+        workspaceId: "test",
+        paths: ["README.md"],
+      }),
+    ).rejects.toMatchObject({ code: "NOT_GIT_REPOSITORY" });
+
+    expect(transport.execCommands.map((entry) => entry.argv)).toEqual([
+      ["rev-parse", "--is-inside-work-tree"],
+      ["rev-parse", "--show-toplevel"],
+    ]);
+  });
+
+  it("creates a typed feature branch remotely with exact HEAD preconditions", async () => {
+    queueRepository(transport);
+    transport.execResults.push(
+      remoteResult(`${SHA_A}\n`),
+      remoteResult("", 128),
+      remoteResult(),
+      remoteResult(`${SHA_A}\n`),
+    );
+
+    const result = await executor.createBranch({
+      workspaceId: "test",
+      branch: "feature/ssh",
+      expectedHeadSha: SHA_A,
+    });
+
+    expect(result).toEqual({
+      root: ".",
+      branch: "feature/ssh",
+      headSha: SHA_A,
+    });
+    const mutation = transport.execCommands.at(-2);
+    expect(mutation?.executable).toBe("git");
+    expect(mutation?.argv.slice(-4)).toEqual([
+      "switch",
+      "-c",
+      "feature/ssh",
+      SHA_A,
+    ]);
+    expect(mutation?.argv).toEqual(expect.arrayContaining([
+      "-c",
+      "commit.gpgSign=false",
+      "merge.gpgSign=false",
+    ]));
+  });
+
+  it("stages and unstages only explicit authorized remote paths", async () => {
+    queueRepository(transport);
+    transport.execResults.push(
+      remoteResult(),
+      remoteResult(`${SHA_A}\n`),
+      remoteResult(`${SHA_B}\n`),
+    );
+    const staged = await executor.stagePaths({
+      workspaceId: "test",
+      paths: ["src/a.ts"],
+    });
+    expect(staged).toEqual({
+      root: ".",
+      headSha: SHA_A,
+      indexTreeSha: SHA_B,
+      paths: ["src/a.ts"],
+    });
+    expect(transport.execCommands.at(-3)?.argv.slice(-3)).toEqual([
+      "add",
+      "--",
+      "src/a.ts",
+    ]);
+
+    transport.execCommands.length = 0;
+    queueRepository(transport);
+    transport.execResults.push(
+      remoteResult(`${SHA_A}\n`),
+      remoteResult(`${SHA_B}\n`),
+      remoteResult(),
+      remoteResult(`${SHA_A}\n`),
+      remoteResult(`${SHA_C}\n`),
+    );
+    const unstaged = await executor.unstagePaths({
+      workspaceId: "test",
+      paths: ["src/a.ts"],
+      expectedHeadSha: SHA_A,
+      expectedIndexTreeSha: SHA_B,
+    });
+    expect(unstaged).toEqual({
+      root: ".",
+      headSha: SHA_A,
+      indexTreeSha: SHA_C,
+      paths: ["src/a.ts"],
+    });
+    expect(transport.execCommands.at(-3)?.argv.slice(-4)).toEqual([
+      "restore",
+      "--staged",
+      "--",
+      "src/a.ts",
+    ]);
+  });
+
+  it("blocks remote staging paths denied by workspace policy", async () => {
+    queueRepository(transport);
+
+    await expect(
+      executor.stagePaths({
+        workspaceId: "test",
+        paths: ["private/secret.txt"],
+      }),
+    ).rejects.toMatchObject({ code: "BLOCKED_PATH" });
+
+    expect(transport.execCommands).toHaveLength(2);
+  });
+
+  it("commits remotely only after exact branch, HEAD and index checks", async () => {
+    queueRepository(transport);
+    transport.execResults.push(
+      remoteResult("feature/ssh\n"),
+      remoteResult(`${SHA_A}\n`),
+      remoteResult(`${SHA_B}\n`),
+      remoteResult(),
+      remoteResult(`${SHA_C}\n`),
+    );
+
+    const result = await executor.commit({
+      workspaceId: "test",
+      message: "feat: remote typed git",
+      expectedHeadSha: SHA_A,
+      expectedIndexTreeSha: SHA_B,
+    });
+
+    expect(result).toEqual({
+      root: ".",
+      branch: "feature/ssh",
+      commitSha: SHA_C,
+    });
+    expect(transport.execCommands.at(-2)?.argv.slice(-3)).toEqual([
       "commit",
-      "mergeBranch",
-      "pushBranch",
+      "-m",
+      "feat: remote typed git",
+    ]);
+
+    transport.execCommands.length = 0;
+    queueRepository(transport);
+    transport.execResults.push(remoteResult("main\n"));
+    await expect(
+      executor.commit({
+        workspaceId: "test",
+        message: "blocked",
+        expectedHeadSha: SHA_A,
+        expectedIndexTreeSha: SHA_B,
+      }),
+    ).rejects.toMatchObject({ code: "GIT_PROTECTED_BRANCH" });
+    expect(transport.execCommands).toHaveLength(3);
+  });
+
+  it("fast-forwards a remote branch only after clean exact preconditions", async () => {
+    queueRepository(transport);
+    transport.execResults.push(
+      remoteResult("dev\n"),
+      remoteResult(`${SHA_A}\n`),
+      remoteResult(`${SHA_B}\n`),
+      remoteResult("", 0),
+      remoteResult("", 0),
+      remoteResult("", 0),
+      remoteResult(),
+      remoteResult(`${SHA_B}\n`),
+    );
+
+    const result = await executor.mergeBranch({
+      workspaceId: "test",
+      sourceBranch: "feature/source",
+      expectedTargetHeadSha: SHA_A,
+      expectedSourceHeadSha: SHA_B,
+    });
+
+    expect(result).toEqual({
+      root: ".",
+      branch: "dev",
+      previousHeadSha: SHA_A,
+      headSha: SHA_B,
+      sourceHeadSha: SHA_B,
+      fastForwarded: true,
+    });
+    expect(transport.execCommands.at(-2)?.argv.slice(-3)).toEqual([
+      "merge",
+      "--ff-only",
+      SHA_B,
+    ]);
+  });
+
+  it("reconciles an ambiguous remote push before reporting completion", async () => {
+    queueRepository(transport);
+    transport.execResults.push(
+      remoteResult(`${SHA_C}\n`),
+      remoteResult(`${SHA_A}\trefs/heads/feature/ssh\n`),
+      remoteResult("", 1),
+      remoteResult(`${SHA_C}\trefs/heads/feature/ssh\n`),
+    );
+
+    const result = await executor.pushBranch({
+      workspaceId: "test",
+      branch: "feature/ssh",
+      expectedLocalSha: SHA_C,
+      remote: "origin",
+      expectedRemoteSha: SHA_A,
+    });
+
+    expect(result).toEqual({
+      status: "completed",
+      root: ".",
+      remote: "origin",
+      branch: "feature/ssh",
+      localSha: SHA_C,
+      remoteSha: SHA_C,
+    });
+    const push = transport.execCommands.at(-2);
+    expect(push?.argv.slice(-3)).toEqual([
+      "push",
+      "origin",
+      `${SHA_C}:refs/heads/feature/ssh`,
+    ]);
+  });
+
+  it("requires reconciliation when an ambiguous remote push resolves elsewhere", async () => {
+    queueRepository(transport);
+    transport.execResults.push(
+      remoteResult(`${SHA_C}\n`),
+      remoteResult(`${SHA_A}\trefs/heads/feature/ssh\n`),
+      remoteResult("", 1),
+      remoteResult(`${SHA_D}\trefs/heads/feature/ssh\n`),
+    );
+
+    await expect(
+      executor.pushBranch({
+        workspaceId: "test",
+        branch: "feature/ssh",
+        expectedLocalSha: SHA_C,
+        remote: "origin",
+        expectedRemoteSha: SHA_A,
+      }),
+    ).rejects.toMatchObject({ code: "SOURCE_CONTROL_RECONCILIATION_REQUIRED" });
+  });
+
+  it("keeps typed GitHub operations unsupported without touching the SSH transport", async () => {
+    const methods = [
       "getRepository",
       "createRepository",
       "getPullRequest",
@@ -306,6 +569,7 @@ describe("SshWorkspaceExecutor", () => {
       });
     }
     expect(transport.commands).toHaveLength(0);
+    expect(transport.execCommands).toHaveLength(0);
   });
 });
 

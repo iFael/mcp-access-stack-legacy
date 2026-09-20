@@ -255,6 +255,9 @@ function Invoke-McpRequest([object]$Request) {
                 $inner = @'
 $ErrorActionPreference='Continue'
 $payload=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__PAYLOAD__'))|ConvertFrom-Json
+$env:GIT_TERMINAL_PROMPT='0'
+$env:GCM_INTERACTIVE='Never'
+$env:GIT_PAGER='cat'
 & ([string]$payload.executable) @($payload.args | ForEach-Object { [string]$_ })
 exit $(if($null -eq $LASTEXITCODE){0}else{$LASTEXITCODE})
 '@
