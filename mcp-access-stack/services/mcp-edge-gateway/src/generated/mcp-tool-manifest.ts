@@ -1133,7 +1133,7 @@ export const EDGE_MCP_TOOL_MANIFEST = [
       "openWorldHint": false,
       "readOnlyHint": false
     },
-    "description": "Preferred general command runner. Executes one explicit command in an allowed shell with the workspace root as the default working directory. Use it for PowerShell, pwsh, cmd, wsl or git-bash when the caller needs to choose the shell explicitly. Commands classified as potentially destructive return confirmation_required before execution.",
+    "description": "Preferred general command runner. Executes one explicit command in an allowed shell with the workspace root as the default working directory. Use it for PowerShell, pwsh, cmd, wsl or git-bash when the caller needs to choose the shell explicitly. Commands classified as potentially destructive return confirmation_required before execution. Commands with timeoutMs above 60000 are started as persisted background tasks instead of holding the MCP request open.",
     "execution": {
       "taskSupport": "forbidden"
     },
@@ -2725,7 +2725,7 @@ export const EDGE_MCP_TOOL_MANIFEST = [
       "openWorldHint": false,
       "readOnlyHint": true
     },
-    "description": "Waits up to timeoutMs for one persisted background task to reach a terminal state. A wait timeout stops waiting only and never cancels the task. Returns the current/terminal task plus size-limited redacted stdout/stderr tails.",
+    "description": "Short-polls one persisted background task for at most 30 seconds. A wait timeout stops waiting only and never cancels the task. For longer work, use get_background_task or get_background_tasks between polls. Returns the current/terminal task plus size-limited redacted stdout/stderr tails.",
     "execution": {
       "taskSupport": "forbidden"
     },
@@ -2745,9 +2745,9 @@ export const EDGE_MCP_TOOL_MANIFEST = [
           "type": "integer"
         },
         "timeoutMs": {
-          "default": 60000,
+          "default": 15000,
           "exclusiveMinimum": 0,
-          "maximum": 300000,
+          "maximum": 30000,
           "type": "integer"
         },
         "workspaceId": {
@@ -13821,13 +13821,13 @@ export const EDGE_MCP_TOOL_MANIFEST = [
 ] as const;
 
 export const EDGE_MCP_CATALOG_METADATA = {
-  "contractRevision": "b5dce5901807f848011f7f5de705fb3bff6858adfb7b7373e875ac3425b1aaac",
-  "serverVersion": "0.4.0-catalog.cb5dce5901807.sdb8f3250a09b",
+  "contractRevision": "3da30195a22fb1ef009a5ddeeaa727debda84504d6e03ef9bda331565cc5e231",
+  "serverVersion": "0.4.0-catalog.c3da30195a22f.sdb8f3250a09b",
   "toolCount": 64,
   "toolSetRevision": "db8f3250a09b5a405ea6d2d82db10347781f661d9e108e5bc3da2b7dbfdaf59f"
 } as const;
 
 export const EDGE_MCP_SERVER_IDENTITY = {
   "name": "vs-code-gpt",
-  "version": "0.4.0-catalog.cb5dce5901807.sdb8f3250a09b"
+  "version": "0.4.0-catalog.c3da30195a22f.sdb8f3250a09b"
 } as const;

@@ -11,7 +11,7 @@ import {
   cancelBackgroundTaskInputSchema,
   getBackgroundTaskInputSchema,
   getBackgroundTasksInputSchema,
-  waitBackgroundTaskInputSchema,
+  waitBackgroundTaskToolInputSchema,
   listBackgroundTasksInputSchema,
   readBackgroundTaskLogsInputSchema,
   startBackgroundTaskInputSchema,
@@ -673,7 +673,8 @@ export function registerWorkspaceTools(
         description:
           "Preferred general command runner. Executes one explicit command in an allowed shell with the workspace root as the default working directory. " +
           "Use it for PowerShell, pwsh, cmd, wsl or git-bash when the caller needs to choose the shell explicitly. " +
-          "Commands classified as potentially destructive return confirmation_required before execution.",
+          "Commands classified as potentially destructive return confirmation_required before execution. " +
+          "Commands with timeoutMs above 60000 are started as persisted background tasks instead of holding the MCP request open.",
         inputSchema: runCommandTransportInputSchema,
         outputSchema: runCommandMcpResultSchema,
         annotations: {
@@ -851,8 +852,8 @@ export function registerWorkspaceTools(
       {
         title: "Wait for background task",
         description:
-          "Waits up to timeoutMs for one persisted background task to reach a terminal state. A wait timeout stops waiting only and never cancels the task. Returns the current/terminal task plus size-limited redacted stdout/stderr tails.",
-        inputSchema: waitBackgroundTaskInputSchema,
+          "Short-polls one persisted background task for at most 30 seconds. A wait timeout stops waiting only and never cancels the task. For longer work, use get_background_task or get_background_tasks between polls. Returns the current/terminal task plus size-limited redacted stdout/stderr tails.",
+        inputSchema: waitBackgroundTaskToolInputSchema,
         outputSchema: backgroundTaskWaitResultSchema,
         annotations: toolAnnotations,
         _meta: meta,
@@ -861,7 +862,7 @@ export function registerWorkspaceTools(
         const authError = validateAuthentication(options, extra.authInfo);
         if (authError) return authError;
         try {
-          const parsedInput = waitBackgroundTaskInputSchema.parse(input);
+          const parsedInput = waitBackgroundTaskToolInputSchema.parse(input);
           const structuredContent = backgroundTaskWaitResultSchema.parse(
             await withToolOperationContext(
               options.operationContextFactory,
@@ -1257,7 +1258,7 @@ async function executeCommand(
   const direct = directRunCommandInputSchema.safeParse(input);
   if (
     !direct.success ||
-    direct.data.timeoutMs <= MAX_SYNCHRONOUS_OPERATION_TIMEOUT_MS
+    direct.data.timeoutMs <= QUICK_OPERATION_TIMEOUT_MS
   ) {
     return executor.runCommand(input, context);
   }

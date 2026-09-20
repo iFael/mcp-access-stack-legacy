@@ -450,7 +450,7 @@ describe("registerWorkspaceTools", () => {
       {
         workspaceId: "ws",
         objective: "Executar uma operaÃ§Ã£o qualificada",
-        timeoutMs: 300_001,
+        timeoutMs: 60_001,
       },
       { signal: new AbortController().signal },
     );
@@ -513,7 +513,7 @@ describe("registerWorkspaceTools", () => {
     expect(executor.calls).toEqual([]);
   });
 
-  it("routes commands above 300 seconds to a deduplicated persistent task", async () => {
+  it("routes commands above 60 seconds to a deduplicated persistent task", async () => {
     const executor = new MockWorkspaceExecutor();
     const server = new McpServer(
       { name: "test", version: "0.0.0" },
@@ -530,7 +530,7 @@ describe("registerWorkspaceTools", () => {
         workspaceId: "ws",
         shell: "git-bash",
         command,
-        timeoutMs: 300_001,
+        timeoutMs: 60_001,
         confirmationId: "long-command-confirmation",
       },
       { signal: new AbortController().signal },
@@ -538,14 +538,14 @@ describe("registerWorkspaceTools", () => {
 
     expect(result.structuredContent).toMatchObject({
       status: "background_task_started",
-      task: { state: "running", timeoutMs: 300_001, command },
+      task: { state: "running", timeoutMs: 60_001, command },
     });
     expect(executor.calls).toEqual(["startBackgroundTask"]);
     expect(executor.backgroundInputs).toEqual([
       expect.objectContaining({
         operation: "run_command",
         command,
-        timeoutMs: 300_001,
+        timeoutMs: 60_001,
         confirmationId: "long-command-confirmation",
       }),
     ]);
@@ -567,7 +567,7 @@ describe("registerWorkspaceTools", () => {
         workspaceId: "ws",
         shell: "powershell",
         command: "Remove-Item stale.txt -Force",
-        timeoutMs: 300_001,
+        timeoutMs: 60_001,
         confirmationId: "background-confirmation",
       },
       { signal: new AbortController().signal },
@@ -609,7 +609,7 @@ describe("registerWorkspaceTools", () => {
         workspaceId: "ws",
         shell: "powershell",
         command: "Remove-Item stale.txt -Force",
-        timeoutMs: 300_001,
+        timeoutMs: 60_001,
       },
       { signal: new AbortController().signal },
     );
@@ -716,7 +716,7 @@ describe("registerWorkspaceTools", () => {
       "wait_background_task",
     ]);
   });
-  it("keeps a 300 second command in the synchronous path", async () => {
+  it("keeps a 60 second command in the synchronous path", async () => {
     const executor = new MockWorkspaceExecutor();
     const server = new McpServer(
       { name: "test", version: "0.0.0" },
@@ -732,7 +732,7 @@ describe("registerWorkspaceTools", () => {
         workspaceId: "ws",
         shell: "git-bash",
         command: "echo ok",
-        timeoutMs: 300_000,
+        timeoutMs: 60_000,
       },
       { signal: new AbortController().signal },
     );

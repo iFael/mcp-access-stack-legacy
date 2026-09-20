@@ -144,6 +144,22 @@ export const waitBackgroundTaskInputSchema = z
   .strict();
 export type WaitBackgroundTaskInput = z.input<typeof waitBackgroundTaskInputSchema>;
 export type ParsedWaitBackgroundTaskInput = z.output<typeof waitBackgroundTaskInputSchema>;
+
+export const waitBackgroundTaskToolInputSchema = z
+  .object({
+    workspaceId: workspaceIdSchema,
+    id: taskIdSchema,
+    timeoutMs: z.number().int().positive().max(30_000).default(15_000),
+    maxBytes: z.number().int().positive().max(1_000_000).default(100_000),
+  })
+  .strict();
+export type WaitBackgroundTaskToolInput = z.input<
+  typeof waitBackgroundTaskToolInputSchema
+>;
+export type ParsedWaitBackgroundTaskToolInput = z.output<
+  typeof waitBackgroundTaskToolInputSchema
+>;
+
 export const listBackgroundTasksInputSchema = z
   .object({
     workspaceId: workspaceIdSchema,
