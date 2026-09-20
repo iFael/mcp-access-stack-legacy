@@ -51,10 +51,8 @@ import {
   createChallenge,
   createIpRateLimiter,
   createMcpRequestLifecycleMiddleware,
-  createMcpTransportObservationMiddleware,
   createOriginMiddleware,
   createSubjectRateLimiter,
-  isMcpInitializeRequest,
   isToolCall,
   type AuthenticatedRequest,
 } from "./http/mcp-middleware.js";
@@ -169,7 +167,6 @@ export function createGatewayApplication(
       limit: config.agent.maxPayloadBytes,
       type: ["application/json", "application/*+json"],
     }),
-    createMcpTransportObservationMiddleware(logger, config.mcpSessionMode),
   ];
 
   if (config.authMode === "oauth") {
@@ -373,7 +370,10 @@ export function createGatewayApplication(
 
   mountGptActions(app, config, workspaceExecutor, logger, browser);
 
-  app.use(config.mcpPath, createMcpRequestLifecycleMiddleware(logger));
+  app.use(
+    config.mcpPath,
+    createMcpRequestLifecycleMiddleware(logger, config.mcpSessionMode),
+  );
   app.use(config.mcpPath, ...mcpMiddlewares);
 
   app.post(config.mcpPath, async (request: AuthenticatedRequest, response, next) => {
@@ -389,6 +389,11 @@ export function createGatewayApplication(
       requestedSessionId === undefined
         ? undefined
         : statefulSessions.get(requestedSessionId);
+    request.mcpTransportMode =
+      config.mcpSessionMode === "stateful-experiment" &&
+      (requestedSessionId !== undefined || isMcpInitializeRequest(request.body))
+        ? "stateful"
+        : "stateless";
     const principalKey =
       config.mcpSessionMode === "stateful-experiment"
         ? createMcpPrincipalKey(request, { ignoreMcpSessionId: true })
@@ -576,6 +581,10 @@ export function createGatewayApplication(
     response: Response,
     next: NextFunction,
   ): Promise<void> => {
+    request.mcpTransportMode =
+      config.mcpSessionMode === "stateful-experiment"
+        ? "stateful"
+        : "stateless";
     if (config.mcpSessionMode !== "stateful-experiment") {
       response.status(405).json({ error: "method_not_allowed" });
       return;
@@ -687,6 +696,15 @@ function bindMcpHttpRequestAbort(
       response.removeListener("close", onClose);
     },
   };
+}
+
+function isMcpInitializeRequest(body: unknown): boolean {
+  return (
+    typeof body === "object" &&
+    body !== null &&
+    !Array.isArray(body) &&
+    (body as { method?: unknown }).method === "initialize"
+  );
 }
 
 function isCancellationOnlyMcpBody(body: unknown): boolean {

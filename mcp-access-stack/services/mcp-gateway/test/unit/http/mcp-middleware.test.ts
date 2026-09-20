@@ -1,13 +1,12 @@
+import { EventEmitter } from "node:events";
 import { describe, expect, test, jest } from "@jest/globals";
 import type { Request, Response } from "express";
 import type { Logger } from "pino";
 import {
   createChallenge,
-  createMcpTransportObservationMiddleware,
+  createMcpRequestLifecycleMiddleware,
   createOriginMiddleware,
-  isMcpInitializeRequest,
   isToolCall,
-  resolveMcpTransportMode,
   type AuthenticatedRequest,
 } from "../../../src/http/mcp-middleware.js";
 
@@ -26,39 +25,112 @@ describe("MCP HTTP middleware helpers", () => {
     expect(isToolCall(null)).toBe(false);
   });
 
-  test("classifies stateless and stateful MCP transport without exposing session ids", () => {
-    expect(resolveMcpTransportMode("stateless", "POST", { method: "initialize" }, true)).toBe("stateless");
-    expect(resolveMcpTransportMode("stateful-experiment", "POST", { method: "initialize" }, false)).toBe("stateful");
-    expect(resolveMcpTransportMode("stateful-experiment", "POST", { method: "tools/list" }, true)).toBe("stateful");
-    expect(resolveMcpTransportMode("stateful-experiment", "POST", { method: "tools/list" }, false)).toBe("stateless");
-    expect(isMcpInitializeRequest({ method: "initialize" })).toBe(true);
-    expect(isMcpInitializeRequest([{ method: "initialize" }])).toBe(false);
-
+  test("logs final transport mode and only session-id presence", () => {
     const info = jest.fn();
-    const next = jest.fn();
-    const request = {
+    const logger = { info } as unknown as Logger;
+    const request = Object.assign(new EventEmitter(), {
       method: "POST",
-      body: { method: "initialize" },
-      mcpRequestId: "request-1",
-      header: (name: string) => name.toLowerCase() === "mcp-session-id"
-        ? "secret-session-id-must-not-be-logged"
-        : undefined,
-    } as unknown as AuthenticatedRequest;
-    createMcpTransportObservationMiddleware(
-      { info } as unknown as Logger,
-      "stateful-experiment",
-    )(request, {} as Response, next);
+      path: "/mcp",
+      header: (name: string) =>
+        name.toLowerCase() === "mcp-session-id"
+          ? "sensitive-session-id-must-not-be-logged"
+          : undefined,
+    }) as unknown as AuthenticatedRequest;
+    const response = Object.assign(new EventEmitter(), {
+      setHeader: jest.fn(),
+      statusCode: 200,
+      headersSent: true,
+      writableEnded: true,
+    }) as unknown as Response;
+    const next = jest.fn();
 
-    expect(request.mcpTransportMode).toBe("stateful");
-    expect(request.mcpSessionIdPresent).toBe(true);
+    createMcpRequestLifecycleMiddleware(
+      logger,
+      "stateful-experiment",
+    )(request, response, next);
+
     expect(next).toHaveBeenCalledTimes(1);
-    expect(info).toHaveBeenCalledWith({
-      event: "mcp_http_transport_selected",
-      requestId: "request-1",
-      mcpTransportMode: "stateful",
-      mcpSessionIdPresent: true,
+    expect(request.mcpTransportMode).toBe("stateful");
+    expect(info).toHaveBeenCalledTimes(1);
+    expect(info.mock.calls[0]?.[0]).toMatchObject({
+      event: "mcp_http_request_started",
+      hasMcpSessionId: true,
     });
-    expect(JSON.stringify(info.mock.calls)).not.toContain("secret-session-id-must-not-be-logged");
+    expect(info.mock.calls[0]?.[0]).not.toHaveProperty("mcpTransportMode");
+
+    (response as unknown as EventEmitter).emit("finish");
+
+    expect(info).toHaveBeenCalledTimes(2);
+    expect(info.mock.calls[1]?.[0]).toMatchObject({
+      event: "mcp_http_request_completed",
+      mcpTransportMode: "stateful",
+      hasMcpSessionId: true,
+      status: "completed",
+      statusCode: 200,
+    });
+    expect(JSON.stringify(info.mock.calls)).not.toContain(
+      "sensitive-session-id-must-not-be-logged",
+    );
+  });
+
+  test("keeps stateless mode when a session header is sent while stateful support is disabled", () => {
+    const info = jest.fn();
+    const logger = { info } as unknown as Logger;
+    const request = Object.assign(new EventEmitter(), {
+      method: "POST",
+      path: "/mcp",
+      header: (name: string) =>
+        name.toLowerCase() === "mcp-session-id"
+          ? "ignored-session-header"
+          : undefined,
+    }) as unknown as AuthenticatedRequest;
+    const response = Object.assign(new EventEmitter(), {
+      setHeader: jest.fn(),
+      statusCode: 200,
+      headersSent: true,
+      writableEnded: true,
+    }) as unknown as Response;
+
+    createMcpRequestLifecycleMiddleware(
+      logger,
+      "stateless",
+    )(request, response, jest.fn());
+    (response as unknown as EventEmitter).emit("finish");
+
+    expect(request.mcpTransportMode).toBe("stateless");
+    expect(info.mock.calls[1]?.[0]).toMatchObject({
+      event: "mcp_http_request_completed",
+      mcpTransportMode: "stateless",
+      hasMcpSessionId: true,
+    });
+    expect(JSON.stringify(info.mock.calls)).not.toContain(
+      "ignored-session-header",
+    );
+  });
+
+  test("defaults final transport observability to stateless when no stateful route was selected", () => {
+    const info = jest.fn();
+    const logger = { info } as unknown as Logger;
+    const request = Object.assign(new EventEmitter(), {
+      method: "POST",
+      path: "/mcp",
+      header: () => undefined,
+    }) as unknown as AuthenticatedRequest;
+    const response = Object.assign(new EventEmitter(), {
+      setHeader: jest.fn(),
+      statusCode: 400,
+      headersSent: true,
+      writableEnded: true,
+    }) as unknown as Response;
+
+    createMcpRequestLifecycleMiddleware(logger)(request, response, jest.fn());
+    (response as unknown as EventEmitter).emit("finish");
+
+    expect(info.mock.calls[1]?.[0]).toMatchObject({
+      event: "mcp_http_request_completed",
+      mcpTransportMode: "stateless",
+      hasMcpSessionId: false,
+    });
   });
 
   test("allows missing or trusted origins and rejects an untrusted origin", () => {

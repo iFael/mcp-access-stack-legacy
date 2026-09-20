@@ -9,37 +9,38 @@ import {
 } from "../auth/jwt-verifier.js";
 import type { GatewayConfig } from "../config.js";
 
-export type McpTransportMode = "stateless" | "stateful";
-
 export type AuthenticatedRequest = Request & {
   auth?: AuthInfo;
   mcpRequestId?: string;
   mcpRequestStartedAt?: number;
   mcpBenchmarkTiming?: boolean;
-  mcpTransportMode?: McpTransportMode;
-  mcpSessionIdPresent?: boolean;
+  mcpTransportMode?: "stateless" | "stateful";
 };
 
-export function createMcpRequestLifecycleMiddleware(logger: Logger): RequestHandler {
+export function createMcpRequestLifecycleMiddleware(
+  logger: Logger,
+  mcpSessionMode: GatewayConfig["mcpSessionMode"] = "stateless",
+): RequestHandler {
   return (request: AuthenticatedRequest, response, next) => {
     const requestId = randomUUID();
     const startedAt = performance.now();
     let finalized = false;
+    const hasMcpSessionId = Boolean(request.header("mcp-session-id"));
     request.mcpRequestId = requestId;
     request.mcpRequestStartedAt = startedAt;
     request.mcpBenchmarkTiming =
       request.header("x-mcp-benchmark-timing") === "1";
-    const mcpSessionIdPresent = Boolean(request.header("mcp-session-id")?.trim());
-    request.mcpSessionIdPresent = mcpSessionIdPresent;
+    request.mcpTransportMode =
+      mcpSessionMode === "stateful-experiment" && hasMcpSessionId
+        ? "stateful"
+        : "stateless";
     response.setHeader("x-mcp-request-id", requestId);
 
     const base = {
       requestId,
       method: request.method,
       path: request.path,
-      transportMode: "stateless-json",
-      hasMcpSessionId: mcpSessionIdPresent,
-      mcpSessionIdPresent,
+      hasMcpSessionId,
       hasLastEventId: Boolean(request.header("last-event-id")),
     };
     logger.info({ event: "mcp_http_request_started", ...base });
@@ -50,8 +51,7 @@ export function createMcpRequestLifecycleMiddleware(logger: Logger): RequestHand
       logger.info({
         event,
         ...base,
-        mcpTransportMode: request.mcpTransportMode ?? "stateless",
-        mcpSessionIdPresent: request.mcpSessionIdPresent ?? mcpSessionIdPresent,
+        mcpTransportMode: request.mcpTransportMode,
         status,
         statusCode: response.statusCode,
         durationMs: Math.round((performance.now() - startedAt) * 1_000) / 1_000,
@@ -68,52 +68,6 @@ export function createMcpRequestLifecycleMiddleware(logger: Logger): RequestHand
     });
     next();
   };
-}
-
-export function createMcpTransportObservationMiddleware(
-  logger: Logger,
-  configuredMode: GatewayConfig["mcpSessionMode"],
-): RequestHandler {
-  return (request: AuthenticatedRequest, _response, next) => {
-    const mcpSessionIdPresent = Boolean(request.header("mcp-session-id")?.trim());
-    const mcpTransportMode = resolveMcpTransportMode(
-      configuredMode,
-      request.method,
-      request.body,
-      mcpSessionIdPresent,
-    );
-    request.mcpSessionIdPresent = mcpSessionIdPresent;
-    request.mcpTransportMode = mcpTransportMode;
-    logger.info({
-      event: "mcp_http_transport_selected",
-      requestId: request.mcpRequestId ?? null,
-      mcpTransportMode,
-      mcpSessionIdPresent,
-    });
-    next();
-  };
-}
-
-export function resolveMcpTransportMode(
-  configuredMode: GatewayConfig["mcpSessionMode"],
-  method: string,
-  body: unknown,
-  mcpSessionIdPresent: boolean,
-): McpTransportMode {
-  if (configuredMode !== "stateful-experiment") return "stateless";
-  if (mcpSessionIdPresent) return "stateful";
-  return method.toUpperCase() === "POST" && isMcpInitializeRequest(body)
-    ? "stateful"
-    : "stateless";
-}
-
-export function isMcpInitializeRequest(body: unknown): boolean {
-  return (
-    typeof body === "object" &&
-    body !== null &&
-    !Array.isArray(body) &&
-    (body as { method?: unknown }).method === "initialize"
-  );
 }
 
 export function createAuthenticationMiddleware(
