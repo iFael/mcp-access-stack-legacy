@@ -4,10 +4,13 @@ import {
   AppError,
   mandatoryBlockedGlobs,
   policyFileSchema,
+  readBackgroundTaskOutputInputSchema,
   startBackgroundTaskInputSchema,
   type BackgroundTaskListResult,
   type BackgroundTaskLogsLookupResult,
+  type BackgroundTaskOutputResult,
   type BackgroundTaskResult,
+  type BackgroundTaskStdinResult,
   type BackgroundTaskWaitResult,
   type CancelBackgroundTaskInput,
   type CommandConfirmationRequiredResult,
@@ -26,6 +29,7 @@ import {
   type PatchFileInput,
   type PatchFileResult,
   type ReadBackgroundTaskLogsInput,
+  type ReadBackgroundTaskOutputInput,
   type ReadBinaryFileInput,
   type ReadBinaryFileResult,
   type ReadFileInput,
@@ -39,6 +43,7 @@ import {
   type ShellName,
   type StartBackgroundTaskInput,
   type StartBackgroundTaskResult,
+  type WriteBackgroundTaskStdinInput,
   type WorkspaceExecutor,
   type GitRepositoryExecutor,
   type GitHubExecutor,
@@ -661,6 +666,12 @@ export class SshWorkspaceExecutor implements WorkspaceExecutor, GitRepositoryExe
   ): Promise<StartBackgroundTaskResult> {
     const parsed = startBackgroundTaskInputSchema.parse(input);
     const workspace = this.workspace(parsed.workspaceId);
+    if (parsed.interactive) {
+      throw new AppError(
+        "CAPABILITY_UNSUPPORTED",
+        "Interactive background tasks are not supported by the SSH workspace executor.",
+      );
+    }
     const shell = resolveShell(parsed.shell, workspace.allowedShells);
     const cwd = this.authorizeShellCwd(workspace, parsed.cwd ?? ".");
     const authorization = this.authorizeCommandExecution({
@@ -761,6 +772,39 @@ export class SshWorkspaceExecutor implements WorkspaceExecutor, GitRepositoryExe
         access,
       ),
     };
+  }
+
+  async writeBackgroundTaskStdin(
+    input: WriteBackgroundTaskStdinInput,
+    _context: OperationContext = {},
+  ): Promise<BackgroundTaskStdinResult> {
+    this.workspace(input.workspaceId);
+    throw new AppError(
+      "CAPABILITY_UNSUPPORTED",
+      "Persistent background-task stdin is not supported by the SSH workspace executor.",
+    );
+  }
+
+  async readBackgroundTaskOutput(
+    input: ReadBackgroundTaskOutputInput,
+    context: OperationContext = {},
+  ): Promise<BackgroundTaskOutputResult> {
+    this.workspace(input.workspaceId);
+    const parsed = readBackgroundTaskOutputInputSchema.parse(input);
+    const access = backgroundTaskAccess(context);
+    const task = await this.background.get_background_task(parsed.id, access);
+    if (!task || task.workspaceId !== parsed.workspaceId) {
+      return { task: null, stdout: null, stderr: null };
+    }
+    return this.background.read_background_task_output(
+      parsed.id,
+      {
+        stdoutOffset: parsed.stdoutOffset,
+        stderrOffset: parsed.stderrOffset,
+        maxBytes: parsed.maxBytes,
+      },
+      access,
+    );
   }
 
   private authorizeCommandExecution(input: {

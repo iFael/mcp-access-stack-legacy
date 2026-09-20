@@ -34,6 +34,8 @@ import {
 import {
   backgroundTaskListResultSchema,
   backgroundTaskLogsLookupResultSchema,
+  backgroundTaskOutputResultSchema,
+  backgroundTaskStdinResultSchema,
   backgroundTaskWaitResultSchema,
   backgroundTaskRecordSchema,
   backgroundTaskResultSchema,
@@ -44,7 +46,9 @@ import {
   waitBackgroundTaskInputSchema,
   listBackgroundTasksInputSchema,
   readBackgroundTaskLogsInputSchema,
+  readBackgroundTaskOutputInputSchema,
   startBackgroundTaskInputSchema,
+  writeBackgroundTaskStdinInputSchema,
 } from "./background-task-contracts.js";
 import { commandConfirmationRequiredResultSchema } from "./command-confirmation-contracts.js";
 
@@ -665,6 +669,8 @@ export const relayOperations = [
   "listBackgroundTasks",
   "cancelBackgroundTask",
   "readBackgroundTaskLogs",
+  "writeBackgroundTaskStdin",
+  "readBackgroundTaskOutput",
   ...sourceControlRelayOperations,
 ] as const;
 
@@ -771,6 +777,16 @@ export const relayRequestSchema = z.discriminatedUnion("operation", [
     operation: z.literal("readBackgroundTaskLogs"),
     input: readBackgroundTaskLogsInputSchema,
   }).strict(),
+  z.object({
+    ...relayRequestBase,
+    operation: z.literal("writeBackgroundTaskStdin"),
+    input: writeBackgroundTaskStdinInputSchema,
+  }).strict(),
+  z.object({
+    ...relayRequestBase,
+    operation: z.literal("readBackgroundTaskOutput"),
+    input: readBackgroundTaskOutputInputSchema,
+  }).strict(),
   z.object({ ...relayRequestBase, operation: z.literal("gitCreateBranch"), input: gitCreateBranchInputSchema }).strict(),
   z.object({ ...relayRequestBase, operation: z.literal("gitStagePaths"), input: gitStagePathsInputSchema }).strict(),
   z.object({ ...relayRequestBase, operation: z.literal("gitUnstagePaths"), input: gitUnstagePathsInputSchema }).strict(),
@@ -865,6 +881,8 @@ export const relayResultSchemas = {
   listBackgroundTasks: backgroundTaskListResultSchema,
   cancelBackgroundTask: backgroundTaskResultSchema,
   readBackgroundTaskLogs: backgroundTaskLogsLookupResultSchema,
+  writeBackgroundTaskStdin: backgroundTaskStdinResultSchema,
+  readBackgroundTaskOutput: backgroundTaskOutputResultSchema,
   gitCreateBranch: gitCreateBranchResultSchema,
   gitStagePaths: gitStagePathsResultSchema,
   gitUnstagePaths: gitUnstagePathsResultSchema,

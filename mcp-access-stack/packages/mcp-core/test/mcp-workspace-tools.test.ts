@@ -5,12 +5,15 @@ import { AppError } from "@vs-code-gpt/shared";
 import type {
   BackgroundTaskListResult,
   BackgroundTaskLogsLookupResult,
+  BackgroundTaskOutputResult,
   BackgroundTaskResult,
+  BackgroundTaskStdinResult,
   GetBackgroundTaskInput,
   GetWorkspaceContextResult,
   InspectGitResult,
   ListFilesResult,
   ListWorkspaceRootsResult,
+  ReadBackgroundTaskOutputInput,
   ReadFileInput,
   ReadFileResult,
   RunWorkspaceValidationResult,
@@ -19,6 +22,7 @@ import type {
   SearchFilesResult,
   StartBackgroundTaskInput,
   StartBackgroundTaskResult,
+  WriteBackgroundTaskStdinInput,
   WorkspaceExecutor,
   WorkspaceSummary,
 } from "@vs-code-gpt/shared";
@@ -261,6 +265,48 @@ class MockWorkspaceExecutor implements WorkspaceExecutor {
         stdoutBytes: 4,
         stderrBytes: 0,
         truncated: false,
+      },
+    };
+  }
+
+  async writeBackgroundTaskStdin(
+    input: WriteBackgroundTaskStdinInput,
+  ): Promise<BackgroundTaskStdinResult> {
+    this.calls.push("writeBackgroundTaskStdin");
+    return {
+      task:
+        input.id === backgroundTask.id
+          ? { ...backgroundTask, interactive: true as const }
+          : null,
+      bytesWritten: Buffer.byteLength(input.input ?? "", "utf8"),
+      stdinClosed: input.close ?? false,
+    };
+  }
+
+  async readBackgroundTaskOutput(
+    input: ReadBackgroundTaskOutputInput,
+  ): Promise<BackgroundTaskOutputResult> {
+    this.calls.push("readBackgroundTaskOutput");
+    if (input.id !== backgroundTask.id) {
+      return { task: null, stdout: null, stderr: null };
+    }
+    const stdoutOffset = input.stdoutOffset ?? 0;
+    const stderrOffset = input.stderrOffset ?? 0;
+    return {
+      task: backgroundTask,
+      stdout: {
+        content: stdoutOffset === 0 ? "done" : "",
+        offset: stdoutOffset,
+        nextOffset: 4,
+        totalBytes: 4,
+        eof: true,
+      },
+      stderr: {
+        content: "",
+        offset: stderrOffset,
+        nextOffset: 0,
+        totalBytes: 0,
+        eof: true,
       },
     };
   }
@@ -716,6 +762,75 @@ describe("registerWorkspaceTools", () => {
       "wait_background_task",
     ]);
   });
+  it("routes interactive background stdin and incremental output through typed tools", async () => {
+    const executor = new MockWorkspaceExecutor();
+    const server = new McpServer(
+      { name: "test", version: "0.0.0" },
+      { capabilities: { tools: {} } },
+    );
+    registerWorkspaceTools(server, executor, {
+      includeTools: [
+        "write_background_task_stdin",
+        "read_background_task_output",
+      ],
+      securitySchemes: [{ type: "noauth" }],
+    });
+
+    const stdinTool = registeredTools(server)["write_background_task_stdin"]!;
+    expect(stdinTool.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+    });
+    const stdinResult = await stdinTool.handler(
+      {
+        workspaceId: "ws",
+        id: backgroundTask.id,
+        input: "hello\n",
+        close: false,
+      },
+      { signal: new AbortController().signal },
+    );
+    expect(stdinResult.isError).not.toBe(true);
+    expect(stdinResult.structuredContent).toMatchObject({
+      task: { id: backgroundTask.id, interactive: true },
+      bytesWritten: 6,
+      stdinClosed: false,
+    });
+
+    const outputTool = registeredTools(server)["read_background_task_output"]!;
+    expect(outputTool.annotations).toMatchObject({
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+    });
+    const outputResult = await outputTool.handler(
+      {
+        workspaceId: "ws",
+        id: backgroundTask.id,
+        stdoutOffset: 0,
+        stderrOffset: 0,
+        maxBytes: 256,
+      },
+      { signal: new AbortController().signal },
+    );
+    expect(outputResult.isError).not.toBe(true);
+    expect(outputResult.structuredContent).toMatchObject({
+      task: { id: backgroundTask.id },
+      stdout: {
+        content: "done",
+        offset: 0,
+        nextOffset: 4,
+        totalBytes: 4,
+        eof: true,
+      },
+    });
+    expect(executor.calls).toEqual([
+      "writeBackgroundTaskStdin",
+      "readBackgroundTaskOutput",
+    ]);
+  });
+
   it("keeps a 60 second command in the synchronous path", async () => {
     const executor = new MockWorkspaceExecutor();
     const server = new McpServer(
@@ -828,11 +943,11 @@ const expectedSourceControlAnnotations = {
 } as const;
 
 describe("registerSourceControlTools", () => {
-  it("publishes exactly eleven source-control names inside the 28-tool workspace surface", () => {
+  it("publishes exactly eleven source-control names inside the 33-tool workspace surface", () => {
     expect(SOURCE_CONTROL_TOOL_NAMES).toEqual(sourceControlCases.map(([name]) => name));
     expect(SOURCE_CONTROL_TOOL_NAMES).toHaveLength(11);
-    expect(WORKSPACE_TOOL_NAMES).toHaveLength(31);
-    expect(new Set(WORKSPACE_TOOL_NAMES).size).toBe(31);
+    expect(WORKSPACE_TOOL_NAMES).toHaveLength(33);
+    expect(new Set(WORKSPACE_TOOL_NAMES).size).toBe(33);
   });
 
   it("registers exact annotations and routes each tool to exactly one typed method", async () => {

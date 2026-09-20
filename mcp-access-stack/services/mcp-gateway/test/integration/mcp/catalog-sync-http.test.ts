@@ -19,6 +19,8 @@ const lateToolNames = [
   "list_background_tasks",
   "cancel_background_task",
   "read_background_task_logs",
+  "write_background_task_stdin",
+  "read_background_task_output",
   "browser_open_authorized_site",
   "browser_profile_page",
   "browser_dom_index",
@@ -71,14 +73,14 @@ describe("stateless MCP catalog identity", () => {
       const contractRevision = createMcpToolContractRevision(tools);
 
       expect(capabilities).toMatchObject({ tools: { listChanged: true } });
-      expect(tools).toHaveLength(64);
+      expect(tools).toHaveLength(66);
       expect(tools.map((tool) => tool.name)).toEqual(
         expect.arrayContaining([...lateToolNames]),
       );
       expect(initializeCatalog).toEqual(listCatalog);
       expect(listCatalog).toMatchObject({
         contractRevision,
-        toolCount: 64,
+        toolCount: 66,
       });
       expect(listCatalog).not.toHaveProperty("descriptorRevision");
       expect(serverInfo).toEqual({

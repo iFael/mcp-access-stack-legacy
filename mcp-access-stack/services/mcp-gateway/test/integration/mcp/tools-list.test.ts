@@ -107,7 +107,7 @@ describe("advanced browser tools list", () => {
       const listed = await client.listTools();
       const names = listed.tools.map((tool) => tool.name);
 
-      expect(names).toHaveLength(64);
+      expect(names).toHaveLength(66);
       expect(names).toEqual(expect.arrayContaining([
         "patch_file",
         "read_files",
@@ -124,6 +124,8 @@ describe("advanced browser tools list", () => {
         "list_background_tasks",
         "cancel_background_task",
         "read_background_task_logs",
+        "write_background_task_stdin",
+        "read_background_task_output",
         "git_create_branch",
         "git_push_branch",
         "github_get_repository",

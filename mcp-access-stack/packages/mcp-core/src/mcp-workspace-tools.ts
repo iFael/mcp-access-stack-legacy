@@ -5,7 +5,9 @@ import { z } from "zod";
 import {
   backgroundTaskListResultSchema,
   backgroundTaskLogsLookupResultSchema,
+  backgroundTaskOutputResultSchema,
   backgroundTaskResultSchema,
+  backgroundTaskStdinResultSchema,
   backgroundTasksResultSchema,
   backgroundTaskWaitResultSchema,
   cancelBackgroundTaskInputSchema,
@@ -14,7 +16,9 @@ import {
   waitBackgroundTaskToolInputSchema,
   listBackgroundTasksInputSchema,
   readBackgroundTaskLogsInputSchema,
+  readBackgroundTaskOutputInputSchema,
   startBackgroundTaskInputSchema,
+  writeBackgroundTaskStdinInputSchema,
   startBackgroundTaskMcpResultSchema,
   startBackgroundTaskResultSchema,
 } from "./background-task-contracts.js";
@@ -162,6 +166,8 @@ const BASE_WORKSPACE_TOOL_NAMES = [
   "list_background_tasks",
   "cancel_background_task",
   "read_background_task_logs",
+  "write_background_task_stdin",
+  "read_background_task_output",
 ] as const;
 
 type BaseWorkspaceToolName = (typeof BASE_WORKSPACE_TOOL_NAMES)[number];
@@ -718,7 +724,9 @@ export function registerWorkspaceTools(
       {
         title: "Start background task",
         description:
-          "Starts a long-running command in an authorized workspace. Risky commands require a bound one-shot confirmation before any task is created. Active duplicate commands are deduplicated.",
+          "Starts a long-running command in an authorized workspace. Risky commands require a bound one-shot confirmation before any task is created. " +
+          "Set interactive=true only when persistent stdin is required; interactive start always requires explicit confirmation and can then be controlled with write_background_task_stdin. " +
+          "Active duplicate commands are deduplicated.",
         inputSchema: startBackgroundTaskInputSchema,
         outputSchema: startBackgroundTaskMcpResultSchema,
         annotations: {
@@ -989,6 +997,100 @@ export function registerWorkspaceTools(
           return {
             content: [
               { type: "text", text: formatBackgroundTaskLogsText(structuredContent) },
+            ],
+            structuredContent,
+          };
+        } catch (error) {
+          return toolError(error);
+        }
+      },
+    );
+  }
+
+  if (shouldInclude("write_background_task_stdin", include)) {
+    server.registerTool(
+      "write_background_task_stdin",
+      {
+        title: "Write background task stdin",
+        description:
+          "Writes UTF-8 text to an active background task that was explicitly started with interactive=true. " +
+          "Can optionally close stdin after the write. Interactive start always requires explicit confirmation.",
+        inputSchema: writeBackgroundTaskStdinInputSchema,
+        outputSchema: backgroundTaskStdinResultSchema,
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          openWorldHint: false,
+          idempotentHint: false,
+        },
+        _meta: meta,
+      },
+      async (input, extra) => {
+        const authError = validateAuthentication(options, extra.authInfo);
+        if (authError) return authError;
+        try {
+          const structuredContent = backgroundTaskStdinResultSchema.parse(
+            await withToolOperationContext(
+              options.operationContextFactory,
+              extra,
+              QUICK_OPERATION_TIMEOUT_MS,
+              (context) => executor.writeBackgroundTaskStdin(input, context),
+            ),
+          );
+          return {
+            content: [
+              {
+                type: "text",
+                text: structuredContent.task
+                  ? "Wrote " + structuredContent.bytesWritten + " byte(s); stdinClosed=" + structuredContent.stdinClosed + "."
+                  : "Background task not found.",
+              },
+            ],
+            structuredContent,
+          };
+        } catch (error) {
+          return toolError(error);
+        }
+      },
+    );
+  }
+
+  if (shouldInclude("read_background_task_output", include)) {
+    server.registerTool(
+      "read_background_task_output",
+      {
+        title: "Read background task output",
+        description:
+          "Reads redacted stdout and stderr incrementally from explicit byte offsets. " +
+          "Returns next offsets so callers can continue without re-reading prior output.",
+        inputSchema: readBackgroundTaskOutputInputSchema,
+        outputSchema: backgroundTaskOutputResultSchema,
+        annotations: toolAnnotations,
+        _meta: meta,
+      },
+      async (input, extra) => {
+        const authError = validateAuthentication(options, extra.authInfo);
+        if (authError) return authError;
+        try {
+          const structuredContent = backgroundTaskOutputResultSchema.parse(
+            await withToolOperationContext(
+              options.operationContextFactory,
+              extra,
+              QUICK_OPERATION_TIMEOUT_MS,
+              (context) => executor.readBackgroundTaskOutput(input, context),
+            ),
+          );
+          const stdout = structuredContent.stdout;
+          const stderr = structuredContent.stderr;
+          return {
+            content: [
+              {
+                type: "text",
+                text: structuredContent.task
+                  ? "Read stdout " + (stdout?.offset ?? 0) + "->" + (stdout?.nextOffset ?? 0) +
+                    "; stderr " + (stderr?.offset ?? 0) + "->" + (stderr?.nextOffset ?? 0) + "."
+                  : "Background task not found.",
+              },
             ],
             structuredContent,
           };
@@ -1753,6 +1855,8 @@ export const relayOperationToToolName: Record<RelayOperation, WorkspaceToolName>
   listBackgroundTasks: "list_background_tasks",
   cancelBackgroundTask: "cancel_background_task",
   readBackgroundTaskLogs: "read_background_task_logs",
+  writeBackgroundTaskStdin: "write_background_task_stdin",
+  readBackgroundTaskOutput: "read_background_task_output",
   gitCreateBranch: "git_create_branch",
   gitStagePaths: "git_stage_paths",
   gitUnstagePaths: "git_unstage_paths",

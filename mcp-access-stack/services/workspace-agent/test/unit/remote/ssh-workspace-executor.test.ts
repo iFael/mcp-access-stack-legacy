@@ -179,6 +179,28 @@ describe("SshWorkspaceExecutor", () => {
     expect(transport.commands).toHaveLength(0);
   });
 
+  it("fails closed for interactive background tasks and persistent stdin over SSH", async () => {
+    await expect(
+      executor.startBackgroundTask({
+        workspaceId: "test",
+        operation: "remote-interactive",
+        shell: "powershell",
+        command: "Write-Output 'never-runs'",
+        timeoutMs: 30_000,
+        interactive: true,
+      }),
+    ).rejects.toMatchObject({ code: "CAPABILITY_UNSUPPORTED" });
+    expect(transport.commands).toHaveLength(0);
+
+    await expect(
+      executor.writeBackgroundTaskStdin({
+        workspaceId: "test",
+        id: "123e4567-e89b-42d3-a456-426614174099",
+        input: "hello\n",
+      }),
+    ).rejects.toMatchObject({ code: "CAPABILITY_UNSUPPORTED" });
+  });
+
   it("uses the same confirmation flow for risky remote background tasks", async () => {
     const input = {
       workspaceId: "test",
