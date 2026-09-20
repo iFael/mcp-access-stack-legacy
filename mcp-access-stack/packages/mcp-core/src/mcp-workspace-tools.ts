@@ -6,9 +6,11 @@ import {
   backgroundTaskListResultSchema,
   backgroundTaskLogsLookupResultSchema,
   backgroundTaskResultSchema,
+  backgroundTasksResultSchema,
   backgroundTaskWaitResultSchema,
   cancelBackgroundTaskInputSchema,
   getBackgroundTaskInputSchema,
+  getBackgroundTasksInputSchema,
   waitBackgroundTaskInputSchema,
   listBackgroundTasksInputSchema,
   readBackgroundTaskLogsInputSchema,
@@ -29,6 +31,8 @@ import {
   listWorkspacesResultSchema,
   readFileInputSchema,
   readFileResultSchema,
+  readFilesInputSchema,
+  readFilesResultSchema,
   patchFileInputSchema,
   patchFileResultSchema,
   runWorkspaceValidationInputSchema,
@@ -39,6 +43,8 @@ import {
   runCommandResultSchema,
   searchFilesInputSchema,
   searchFilesResultSchema,
+  searchFilesBatchInputSchema,
+  searchFilesBatchResultSchema,
   writeFileInputSchema,
   writeFileResultSchema,
   type OperationContext,
@@ -140,15 +146,18 @@ const BASE_WORKSPACE_TOOL_NAMES = [
   "list_workspace_roots",
   "list_files",
   "read_file",
+  "read_files",
   "write_file",
   "patch_file",
   "run_workspace_validation",
   "run_command",
   "search_files",
+  "search_files_batch",
   "inspect_workspace_git",
   "get_workspace_context",
   "start_background_task",
   "get_background_task",
+  "get_background_tasks",
   "wait_background_task",
   "list_background_tasks",
   "cancel_background_task",
@@ -436,6 +445,81 @@ export function registerWorkspaceTools(
     );
   }
 
+  if (shouldInclude("read_files", include)) {
+    server.registerTool(
+      "read_files",
+      {
+        title: "Read files",
+        description:
+          "Reads up to 20 text files or line ranges from one workspace in a single call. " +
+          "Each item succeeds or fails independently; output order matches input order.",
+        inputSchema: readFilesInputSchema,
+        outputSchema: readFilesResultSchema,
+        annotations: toolAnnotations,
+        _meta: meta,
+      },
+      async (input, extra) => {
+        const authError = validateAuthentication(options, extra.authInfo);
+        if (authError) {
+          return authError;
+        }
+        try {
+          const structuredContent = readFilesResultSchema.parse(
+            await withToolOperationContext(
+              options.operationContextFactory,
+              extra,
+              QUICK_OPERATION_TIMEOUT_MS,
+              async (context) => ({
+                items: await Promise.all(
+                  input.items.map(async (item) => {
+                    try {
+                      const result = readFileResultSchema.parse(
+                        await executor.readFile(
+                          { workspaceId: input.workspaceId, ...item },
+                          context,
+                        ),
+                      );
+                      return {
+                        status: "ok" as const,
+                        requestedPath: item.path,
+                        result,
+                      };
+                    } catch (error) {
+                      const appError =
+                        error instanceof AppErrorClass ? error : asAppError(error);
+                      return {
+                        status: "error" as const,
+                        requestedPath: item.path,
+                        error: {
+                          code: appError.code,
+                          message: sanitizeOperationDiagnostic(appError.message),
+                        },
+                      };
+                    }
+                  }),
+                ),
+              }),
+            ),
+          );
+          const succeeded = structuredContent.items.filter(
+            (item) => item.status === "ok",
+          ).length;
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Read ${succeeded}/${structuredContent.items.length} file item(s).`,
+              },
+            ],
+            structuredContent,
+          };
+        } catch (error) {
+          return toolError(error);
+        }
+      },
+    );
+  }
+
   if (shouldInclude("write_file", include)) {
     server.registerTool(
       "write_file",
@@ -705,6 +789,62 @@ export function registerWorkspaceTools(
     );
   }
 
+  if (shouldInclude("get_background_tasks", include)) {
+    server.registerTool(
+      "get_background_tasks",
+      {
+        title: "Get background tasks",
+        description:
+          "Returns persisted state for up to 20 background task IDs in one call. " +
+          "Output order matches input order; missing or inaccessible IDs return task=null.",
+        inputSchema: getBackgroundTasksInputSchema,
+        outputSchema: backgroundTasksResultSchema,
+        annotations: toolAnnotations,
+        _meta: meta,
+      },
+      async (input, extra) => {
+        const authError = validateAuthentication(options, extra.authInfo);
+        if (authError) return authError;
+        try {
+          const structuredContent = backgroundTasksResultSchema.parse(
+            await withToolOperationContext(
+              options.operationContextFactory,
+              extra,
+              QUICK_OPERATION_TIMEOUT_MS,
+              async (context) => ({
+                items: await Promise.all(
+                  input.ids.map(async (id) => {
+                    const result = backgroundTaskResultSchema.parse(
+                      await executor.getBackgroundTask(
+                        { workspaceId: input.workspaceId, id },
+                        context,
+                      ),
+                    );
+                    return { id, task: result.task };
+                  }),
+                ),
+              }),
+            ),
+          );
+          const found = structuredContent.items.filter(
+            (item) => item.task !== null,
+          ).length;
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Found ${found}/${structuredContent.items.length} background task(s).`,
+              },
+            ],
+            structuredContent,
+          };
+        } catch (error) {
+          return toolError(error);
+        }
+      },
+    );
+  }
+
   if (shouldInclude("wait_background_task", include)) {
     server.registerTool(
       "wait_background_task",
@@ -888,6 +1028,84 @@ export function registerWorkspaceTools(
           );
           return {
             content: [{ type: "text", text: `Found ${structuredContent.matches.length} match(es).` }],
+            structuredContent,
+          };
+        } catch (error) {
+          return toolError(error);
+        }
+      },
+    );
+  }
+
+  if (shouldInclude("search_files_batch", include)) {
+    server.registerTool(
+      "search_files_batch",
+      {
+        title: "Search files batch",
+        description:
+          "Runs up to 8 independent file-content searches in one workspace call. " +
+          "Each search succeeds or fails independently; output order matches input order.",
+        inputSchema: searchFilesBatchInputSchema,
+        outputSchema: searchFilesBatchResultSchema,
+        annotations: toolAnnotations,
+        _meta: meta,
+      },
+      async (input, extra) => {
+        const authError = validateAuthentication(options, extra.authInfo);
+        if (authError) return authError;
+        try {
+          const structuredContent = searchFilesBatchResultSchema.parse(
+            await withToolOperationContext(
+              options.operationContextFactory,
+              extra,
+              QUICK_OPERATION_TIMEOUT_MS,
+              async (context) => ({
+                items: await Promise.all(
+                  input.items.map(async (item) => {
+                    try {
+                      const searchInput = searchFilesInputSchema.parse({
+                        workspaceId: input.workspaceId,
+                        ...item,
+                      });
+                      const result = searchFilesResultSchema.parse(
+                        await executor.searchFiles(searchInput, context),
+                      );
+                      return {
+                        status: "ok" as const,
+                        query: item.query,
+                        result,
+                      };
+                    } catch (error) {
+                      const appError =
+                        error instanceof AppErrorClass ? error : asAppError(error);
+                      return {
+                        status: "error" as const,
+                        query: item.query,
+                        error: {
+                          code: appError.code,
+                          message: sanitizeOperationDiagnostic(appError.message),
+                        },
+                      };
+                    }
+                  }),
+                ),
+              }),
+            ),
+          );
+          const completed = structuredContent.items.filter(
+            (item) => item.status === "ok",
+          );
+          const matches = completed.reduce(
+            (total, item) => total + item.result.matches.length,
+            0,
+          );
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Completed ${completed.length}/${structuredContent.items.length} search(es); matches=${matches}.`,
+              },
+            ],
             structuredContent,
           };
         } catch (error) {

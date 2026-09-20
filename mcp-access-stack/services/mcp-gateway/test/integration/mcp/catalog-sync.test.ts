@@ -11,9 +11,12 @@ import { createMcpServer } from "../../../src/mcp/server.js";
 
 const expectedLateTools = [
   "patch_file",
+  "read_files",
+  "search_files_batch",
   "list_workspace_roots",
   "start_background_task",
   "get_background_task",
+  "get_background_tasks",
   "wait_background_task",
   "list_background_tasks",
   "cancel_background_task",
@@ -56,7 +59,7 @@ describe("MCP connector catalog synchronization", () => {
         | undefined;
       const contractRevision = createMcpToolContractRevision(listed.tools);
 
-      expect(listed.tools).toHaveLength(61);
+      expect(listed.tools).toHaveLength(64);
       expect(listed.tools.map((tool) => tool.name)).toEqual(
         expect.arrayContaining([...expectedLateTools]),
       );
@@ -71,7 +74,7 @@ describe("MCP connector catalog synchronization", () => {
       expect(descriptions.get_workspace_context).toContain("project instruction files");
       expect(catalogMeta).toMatchObject({
         contractRevision,
-        toolCount: 61,
+        toolCount: 64,
       });
       expect(catalogMeta).not.toHaveProperty("descriptorRevision");
       expect(serverVersion).toEqual({
@@ -179,8 +182,8 @@ describe("MCP server instance catalog continuity", () => {
       );
       expect(secondServerVersion).toEqual(firstServerVersion);
       expect(secondCapabilities).toEqual(firstCapabilities);
-      expect(names).toHaveLength(61);
-      expect(new Set(names).size).toBe(61);
+      expect(names).toHaveLength(64);
+      expect(new Set(names).size).toBe(64);
       expect(metadata?.contractRevision).toBe(
         createMcpToolContractRevision(secondList.tools),
       );

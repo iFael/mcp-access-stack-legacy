@@ -8,8 +8,8 @@ import {
 
 describe("MCP tool catalog identity", () => {
   it("keeps the public tool-name set complete and unique", () => {
-    expect(MCP_FULL_TOOL_CATALOG_NAMES).toHaveLength(61);
-    expect(new Set(MCP_FULL_TOOL_CATALOG_NAMES).size).toBe(61);
+    expect(MCP_FULL_TOOL_CATALOG_NAMES).toHaveLength(64);
+    expect(new Set(MCP_FULL_TOOL_CATALOG_NAMES).size).toBe(64);
   });
 
   it("changes diagnostic tool-set identity when a tool name disappears", () => {

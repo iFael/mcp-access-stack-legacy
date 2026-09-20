@@ -83,6 +83,28 @@ export const readFileInputSchema = z
 
 export type ReadFileInput = z.infer<typeof readFileInputSchema>;
 
+export const readFilesItemInputSchema = z
+  .object({
+    path: relativePathSchema,
+    startLine: z.number().int().positive().optional(),
+    endLine: z.number().int().positive().optional(),
+  })
+  .strict()
+  .refine(
+    ({ startLine, endLine }) =>
+      endLine === undefined || (startLine !== undefined && endLine >= startLine),
+    { message: "endLine requires startLine and must be greater than or equal to it." },
+  );
+
+export const readFilesInputSchema = z
+  .object({
+    workspaceId: workspaceIdSchema,
+    items: z.array(readFilesItemInputSchema).min(1).max(20),
+  })
+  .strict();
+
+export type ReadFilesInput = z.infer<typeof readFilesInputSchema>;
+
 export const readBinaryFileInputSchema = z
   .object({
     workspaceId: workspaceIdSchema,
@@ -331,6 +353,24 @@ export const searchFilesInputSchema = z
 
 export type SearchFilesInput = z.input<typeof searchFilesInputSchema>;
 
+export const searchFilesBatchItemInputSchema = z
+  .object({
+    query: z.string().min(1),
+    root: relativePathSchema.optional(),
+    glob: z.string().min(1).optional(),
+    caseSensitive: z.boolean().default(false),
+  })
+  .strict();
+
+export const searchFilesBatchInputSchema = z
+  .object({
+    workspaceId: workspaceIdSchema,
+    items: z.array(searchFilesBatchItemInputSchema).min(1).max(8),
+  })
+  .strict();
+
+export type SearchFilesBatchInput = z.infer<typeof searchFilesBatchInputSchema>;
+
 export const gitDiffModeSchema = z.enum(["none", "summary", "full"]);
 
 export type GitDiffMode = z.infer<typeof gitDiffModeSchema>;
@@ -450,6 +490,36 @@ export const readFileResultSchema = z
 
 export type ReadFileResult = z.infer<typeof readFileResultSchema>;
 
+export const readFilesItemResultSchema = z.discriminatedUnion("status", [
+  z
+    .object({
+      status: z.literal("ok"),
+      requestedPath: z.string(),
+      result: readFileResultSchema,
+    })
+    .strict(),
+  z
+    .object({
+      status: z.literal("error"),
+      requestedPath: z.string(),
+      error: z
+        .object({
+          code: z.enum(errorCodes),
+          message: z.string(),
+        })
+        .strict(),
+    })
+    .strict(),
+]);
+
+export const readFilesResultSchema = z
+  .object({
+    items: z.array(readFilesItemResultSchema),
+  })
+  .strict();
+
+export type ReadFilesResult = z.infer<typeof readFilesResultSchema>;
+
 export const readBinaryFileResultSchema = z
   .object({
     path: z.string(),
@@ -481,6 +551,36 @@ export const searchFilesResultSchema = z
   .strict();
 
 export type SearchFilesResult = z.infer<typeof searchFilesResultSchema>;
+
+export const searchFilesBatchItemResultSchema = z.discriminatedUnion("status", [
+  z
+    .object({
+      status: z.literal("ok"),
+      query: z.string(),
+      result: searchFilesResultSchema,
+    })
+    .strict(),
+  z
+    .object({
+      status: z.literal("error"),
+      query: z.string(),
+      error: z
+        .object({
+          code: z.enum(errorCodes),
+          message: z.string(),
+        })
+        .strict(),
+    })
+    .strict(),
+]);
+
+export const searchFilesBatchResultSchema = z
+  .object({
+    items: z.array(searchFilesBatchItemResultSchema),
+  })
+  .strict();
+
+export type SearchFilesBatchResult = z.infer<typeof searchFilesBatchResultSchema>;
 
 export const gitStatusEntrySchema = z
   .object({

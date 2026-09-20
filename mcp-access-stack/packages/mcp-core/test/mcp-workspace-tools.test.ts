@@ -1,17 +1,21 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it } from "@jest/globals";
+import { AppError } from "@vs-code-gpt/shared";
 import type {
   BackgroundTaskListResult,
   BackgroundTaskLogsLookupResult,
   BackgroundTaskResult,
+  GetBackgroundTaskInput,
   GetWorkspaceContextResult,
   InspectGitResult,
   ListFilesResult,
   ListWorkspaceRootsResult,
+  ReadFileInput,
   ReadFileResult,
   RunWorkspaceValidationResult,
   RunCommandResult,
+  SearchFilesInput,
   SearchFilesResult,
   StartBackgroundTaskInput,
   StartBackgroundTaskResult,
@@ -44,6 +48,8 @@ const backgroundTask = {
 class MockWorkspaceExecutor implements WorkspaceExecutor {
   calls: string[] = [];
   backgroundInputs: StartBackgroundTaskInput[] = [];
+  readFileFailures = new Set<string>();
+  searchFailures = new Set<string>();
 
   async listWorkspaces(): Promise<WorkspaceSummary[]> {
     this.calls.push("listWorkspaces");
@@ -70,10 +76,13 @@ class MockWorkspaceExecutor implements WorkspaceExecutor {
     return { files: [], truncated: false };
   }
 
-  async readFile(): Promise<ReadFileResult> {
+  async readFile(input: ReadFileInput): Promise<ReadFileResult> {
     this.calls.push("readFile");
+    if (this.readFileFailures.has(input.path)) {
+      throw new AppError("FILE_NOT_FOUND", "Requested file does not exist.");
+    }
     return {
-      path: "a.txt",
+      path: input.path,
       content: "x",
       startLine: 1,
       endLine: 1,
@@ -155,9 +164,18 @@ class MockWorkspaceExecutor implements WorkspaceExecutor {
     };
   }
 
-  async searchFiles(): Promise<SearchFilesResult> {
+  async searchFiles(input: SearchFilesInput): Promise<SearchFilesResult> {
     this.calls.push("searchFiles");
-    return { matches: [], truncated: false, skippedFiles: 0 };
+    if (this.searchFailures.has(input.query)) {
+      throw new AppError("FILE_NOT_FOUND", "Search root does not exist.");
+    }
+    return {
+      matches: [
+        { path: "a.txt", line: 1, column: 1, snippet: input.query },
+      ],
+      truncated: false,
+      skippedFiles: 0,
+    };
   }
 
   async inspectGit(): Promise<InspectGitResult> {
@@ -201,9 +219,9 @@ class MockWorkspaceExecutor implements WorkspaceExecutor {
     };
   }
 
-  async getBackgroundTask(): Promise<BackgroundTaskResult> {
+  async getBackgroundTask(input: GetBackgroundTaskInput): Promise<BackgroundTaskResult> {
     this.calls.push("getBackgroundTask");
-    return { task: backgroundTask };
+    return { task: input.id === backgroundTask.id ? backgroundTask : null };
   }
 
   async waitBackgroundTask(): Promise<import("@vs-code-gpt/shared").BackgroundTaskWaitResult> {
@@ -309,6 +327,112 @@ describe("registerWorkspaceTools", () => {
       truncated: false,
     });
     expect(executor.calls).toEqual(["listWorkspaceRoots"]);
+  });
+
+  it("reads multiple files in one tool call and isolates item failures", async () => {
+    const executor = new MockWorkspaceExecutor();
+    executor.readFileFailures.add("missing.txt");
+    const server = new McpServer(
+      { name: "test", version: "0.0.0" },
+      { capabilities: { tools: {} } },
+    );
+    registerWorkspaceTools(server, executor, {
+      includeTools: ["read_files"],
+      securitySchemes: [{ type: "noauth" }],
+    });
+
+    const result = await registeredTools(server)["read_files"]!.handler(
+      {
+        workspaceId: "ws",
+        items: [
+          { path: "first.txt", startLine: 1, endLine: 1 },
+          { path: "missing.txt" },
+          { path: "third.txt" },
+        ],
+      },
+      { signal: new AbortController().signal },
+    );
+
+    expect(result.isError).not.toBe(true);
+    expect(result.content).toEqual([
+      { type: "text", text: "Read 2/3 file item(s)." },
+    ]);
+    expect(result.structuredContent).toMatchObject({
+      items: [
+        {
+          status: "ok",
+          requestedPath: "first.txt",
+          result: { path: "first.txt", content: "x" },
+        },
+        {
+          status: "error",
+          requestedPath: "missing.txt",
+          error: {
+            code: "FILE_NOT_FOUND",
+            message: "Requested file does not exist.",
+          },
+        },
+        {
+          status: "ok",
+          requestedPath: "third.txt",
+          result: { path: "third.txt", content: "x" },
+        },
+      ],
+    });
+    expect(executor.calls).toEqual(["readFile", "readFile", "readFile"]);
+  });
+
+  it("runs multiple file searches in one tool call and isolates failures", async () => {
+    const executor = new MockWorkspaceExecutor();
+    executor.searchFailures.add("missing-root");
+    const server = new McpServer(
+      { name: "test", version: "0.0.0" },
+      { capabilities: { tools: {} } },
+    );
+    registerWorkspaceTools(server, executor, {
+      includeTools: ["search_files_batch"],
+      securitySchemes: [{ type: "noauth" }],
+    });
+
+    const result = await registeredTools(server)["search_files_batch"]!.handler(
+      {
+        workspaceId: "ws",
+        items: [
+          { query: "alpha" },
+          { query: "missing-root", root: "missing" },
+          { query: "omega", caseSensitive: true },
+        ],
+      },
+      { signal: new AbortController().signal },
+    );
+
+    expect(result.isError).not.toBe(true);
+    expect(result.content).toEqual([
+      { type: "text", text: "Completed 2/3 search(es); matches=2." },
+    ]);
+    expect(result.structuredContent).toMatchObject({
+      items: [
+        {
+          status: "ok",
+          query: "alpha",
+          result: { matches: [{ snippet: "alpha" }] },
+        },
+        {
+          status: "error",
+          query: "missing-root",
+          error: {
+            code: "FILE_NOT_FOUND",
+            message: "Search root does not exist.",
+          },
+        },
+        {
+          status: "ok",
+          query: "omega",
+          result: { matches: [{ snippet: "omega" }] },
+        },
+      ],
+    });
+    expect(executor.calls).toEqual(["searchFiles", "searchFiles", "searchFiles"]);
   });
 
   it("rejects legacy qualified payloads before the executor", async () => {
@@ -540,6 +664,39 @@ describe("registerWorkspaceTools", () => {
     expect(executor.calls).toContain("patchFile");
   });
 
+  it("gets multiple background tasks in one tool call and preserves order", async () => {
+    const executor = new MockWorkspaceExecutor();
+    const server = new McpServer(
+      { name: "test", version: "0.0.0" },
+      { capabilities: { tools: {} } },
+    );
+    registerWorkspaceTools(server, executor, {
+      includeTools: ["get_background_tasks"],
+      securitySchemes: [{ type: "noauth" }],
+    });
+
+    const missingId = "223e4567-e89b-42d3-a456-426614174000";
+    const result = await registeredTools(server)["get_background_tasks"]!.handler(
+      {
+        workspaceId: "ws",
+        ids: [backgroundTask.id, missingId],
+      },
+      { signal: new AbortController().signal },
+    );
+
+    expect(result.isError).not.toBe(true);
+    expect(result.content).toEqual([
+      { type: "text", text: "Found 1/2 background task(s)." },
+    ]);
+    expect(result.structuredContent).toEqual({
+      items: [
+        { id: backgroundTask.id, task: backgroundTask },
+        { id: missingId, task: null },
+      ],
+    });
+    expect(executor.calls).toEqual(["getBackgroundTask", "getBackgroundTask"]);
+  });
+
   it("publishes wait_background_task as a workspace tool", () => {
     expect(WORKSPACE_TOOL_NAMES as readonly string[]).toContain(
       "wait_background_task",
@@ -674,8 +831,8 @@ describe("registerSourceControlTools", () => {
   it("publishes exactly eleven source-control names inside the 28-tool workspace surface", () => {
     expect(SOURCE_CONTROL_TOOL_NAMES).toEqual(sourceControlCases.map(([name]) => name));
     expect(SOURCE_CONTROL_TOOL_NAMES).toHaveLength(11);
-    expect(WORKSPACE_TOOL_NAMES).toHaveLength(28);
-    expect(new Set(WORKSPACE_TOOL_NAMES).size).toBe(28);
+    expect(WORKSPACE_TOOL_NAMES).toHaveLength(31);
+    expect(new Set(WORKSPACE_TOOL_NAMES).size).toBe(31);
   });
 
   it("registers exact annotations and routes each tool to exactly one typed method", async () => {

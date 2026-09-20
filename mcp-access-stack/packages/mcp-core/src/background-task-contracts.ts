@@ -126,6 +126,14 @@ export const getBackgroundTaskInputSchema = z
   .strict();
 export type GetBackgroundTaskInput = z.infer<typeof getBackgroundTaskInputSchema>;
 
+export const getBackgroundTasksInputSchema = z
+  .object({
+    workspaceId: workspaceIdSchema,
+    ids: z.array(taskIdSchema).min(1).max(20),
+  })
+  .strict();
+export type GetBackgroundTasksInput = z.infer<typeof getBackgroundTasksInputSchema>;
+
 export const waitBackgroundTaskInputSchema = z
   .object({
     workspaceId: workspaceIdSchema,
@@ -167,6 +175,20 @@ export const backgroundTaskResultSchema = z
   .object({ task: backgroundTaskRecordSchema.nullable() })
   .strict();
 export type BackgroundTaskResult = z.infer<typeof backgroundTaskResultSchema>;
+
+export const backgroundTasksResultSchema = z
+  .object({
+    items: z.array(
+      z
+        .object({
+          id: taskIdSchema,
+          task: backgroundTaskRecordSchema.nullable(),
+        })
+        .strict(),
+    ),
+  })
+  .strict();
+export type BackgroundTasksResult = z.infer<typeof backgroundTasksResultSchema>;
 
 export const backgroundTaskListResultSchema = z
   .object({ tasks: z.array(backgroundTaskRecordSchema) })
