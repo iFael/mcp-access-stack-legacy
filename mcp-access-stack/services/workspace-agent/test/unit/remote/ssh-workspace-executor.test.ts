@@ -7,6 +7,8 @@ import { SshWorkspaceExecutor } from "../../../src/remote/ssh-workspace-executor
 import type {
   RemoteBytesResult,
   RemoteDirectoryListing,
+  RemoteGitHubApiRequest,
+  RemoteGitHubApiResult,
   RemoteProcessResult,
   RemoteWriteResult,
   SshWindowsTransport,
@@ -22,6 +24,46 @@ function remoteResult(
   exitCode: number | null = 0,
 ): RemoteProcessResult {
   return { exitCode, stdout, stderr: "", timedOut: false };
+}
+
+function githubResponse(
+  value: unknown,
+  statusCode = 200,
+): RemoteGitHubApiResult {
+  return {
+    statusCode,
+    body: statusCode >= 200 && statusCode < 300 ? JSON.stringify(value) : "",
+    authenticationFailed: false,
+  };
+}
+
+function githubRepositoryRecord(
+  owner = "octo",
+  name = "repo",
+  visibility: "private" | "public" | "internal" = "private",
+) {
+  return {
+    owner: { login: owner },
+    name,
+    full_name: `${owner}/${name}`,
+    default_branch: "main",
+    visibility,
+    html_url: `https://github.com/${owner}/${name}`,
+  };
+}
+
+function githubPullRequestRecord(overrides: Record<string, unknown> = {}) {
+  return {
+    number: 7,
+    state: "open",
+    title: "Typed SSH PR",
+    html_url: "https://github.com/octo/repo/pull/7",
+    head: { sha: SHA_C },
+    base: { sha: SHA_A },
+    merged: false,
+    merge_commit_sha: null,
+    ...overrides,
+  };
 }
 
 function queueRepository(
@@ -41,6 +83,8 @@ class FakeTransport {
   commands: Array<{ shell: string; command: string; cwd: string }> = [];
   execCommands: Array<{ executable: string; argv: string[]; cwd: string }> = [];
   execResults: RemoteProcessResult[] = [];
+  githubApiCalls: Array<{ rootPath: string; request: RemoteGitHubApiRequest }> = [];
+  githubApiResults: Array<RemoteGitHubApiResult | Error> = [];
 
   async probeRoot() {
     return { fullPath: "C:\\workspace", kind: "directory" as const };
@@ -91,6 +135,16 @@ class FakeTransport {
     return { exitCode: 0, stdout: "ok\n", stderr: "", timedOut: false };
   }
 
+  async githubApi(
+    rootPath: string,
+    request: RemoteGitHubApiRequest,
+  ): Promise<RemoteGitHubApiResult> {
+    this.githubApiCalls.push({ rootPath, request });
+    const next = this.githubApiResults.shift();
+    if (next instanceof Error) throw next;
+    return next ?? githubResponse({});
+  }
+
   async exec(_root: string, cwd: string, executable: string, argv: string[]): Promise<RemoteProcessResult> {
     this.execCommands.push({ executable, argv, cwd });
     return this.execResults.shift() ?? remoteResult("main\n");
@@ -129,6 +183,17 @@ describe("SshWorkspaceExecutor", () => {
             allowWrites: ["."],
             allowShell: ["."],
             allowedShells: ["powershell", "pwsh"],
+            sourceControl: {
+              capabilities: [
+                "github.repository.read",
+                "github.repository.create",
+                "github.pull_request.read",
+                "github.pull_request.create",
+                "github.pull_request.merge",
+              ],
+              accountOwners: ["octo", "octo-org"],
+              additionalRepositories: ["octo/repo"],
+            },
           },
         ],
       },
@@ -554,22 +619,277 @@ describe("SshWorkspaceExecutor", () => {
     ).rejects.toMatchObject({ code: "SOURCE_CONTROL_RECONCILIATION_REQUIRED" });
   });
 
-  it("keeps typed GitHub operations unsupported without touching the SSH transport", async () => {
-    const methods = [
-      "getRepository",
-      "createRepository",
-      "getPullRequest",
-      "createPullRequest",
-      "mergePullRequest",
-    ] as const;
+  it("reads authorized GitHub repository and pull-request metadata through the remote API", async () => {
+    transport.githubApiResults.push(
+      githubResponse(githubRepositoryRecord()),
+      githubResponse(githubPullRequestRecord()),
+    );
 
-    for (const method of methods) {
-      await expect((executor as any)[method]({ workspaceId: "test" })).rejects.toMatchObject({
-        code: "CAPABILITY_UNSUPPORTED",
-      });
+    await expect(
+      executor.getRepository({
+        workspaceId: "test",
+        owner: "octo",
+        repository: "repo",
+      }),
+    ).resolves.toEqual({
+      owner: "octo",
+      name: "repo",
+      fullName: "octo/repo",
+      defaultBranch: "main",
+      visibility: "private",
+      url: "https://github.com/octo/repo",
+    });
+
+    await expect(
+      executor.getPullRequest({
+        workspaceId: "test",
+        owner: "octo",
+        repository: "repo",
+        pullNumber: 7,
+      }),
+    ).resolves.toMatchObject({
+      number: 7,
+      state: "open",
+      headSha: SHA_C,
+      baseSha: SHA_A,
+      merged: false,
+    });
+
+    expect(transport.githubApiCalls.map((entry) => entry.request.path)).toEqual([
+      "/repos/octo/repo",
+      "/repos/octo/repo/pulls/7",
+    ]);
+  });
+
+  it("authorizes the canonical GitHub repository resolved from the remote origin", async () => {
+    const canonicalExecutor = await SshWorkspaceExecutor.create({
+      policy: {
+        version: 1,
+        workspaces: [
+          {
+            id: "test",
+            name: "Test",
+            rootPath: "C:\\workspace",
+            workspaceKind: "repository",
+            enabled: true,
+            permissionProfile: "full-repo-write",
+            confirmationMode: "standard",
+            allowedRoots: ["."],
+            blockedGlobs: [],
+            limits: {
+              maxFileBytes: 64_000,
+              maxSearchResults: 100,
+              maxSearchSnippetBytes: 20_000,
+              maxDiffBytes: 500_000,
+              maxListedFiles: 500,
+            },
+            allowWrites: ["."],
+            allowShell: ["."],
+            allowedShells: ["powershell", "pwsh"],
+            sourceControl: {
+              capabilities: ["github.repository.read"],
+              accountOwners: [],
+              additionalRepositories: [],
+            },
+          },
+        ],
+      },
+      backgroundStateDirectory: stateDirectory,
+      transport: transport as unknown as SshWindowsTransport,
+    });
+
+    queueRepository(transport);
+    transport.execResults.push(
+      remoteResult("git@github.com:octo/repo.git\n"),
+    );
+    transport.githubApiResults.push(
+      githubResponse(githubRepositoryRecord()),
+    );
+
+    await expect(
+      canonicalExecutor.getRepository({
+        workspaceId: "test",
+        owner: "octo",
+        repository: "repo",
+      }),
+    ).resolves.toMatchObject({
+      fullName: "octo/repo",
+    });
+
+    expect(transport.execCommands.at(-1)?.argv).toEqual([
+      "remote",
+      "get-url",
+      "origin",
+    ]);
+  });
+
+  it("denies GitHub repositories outside canonical/additional policy before API dispatch", async () => {
+    await expect(
+      executor.getRepository({
+        workspaceId: "test",
+        owner: "other",
+        repository: "repo",
+      }),
+    ).rejects.toMatchObject({ code: "SOURCE_CONTROL_CAPABILITY_DENIED" });
+
+    expect(transport.githubApiCalls).toHaveLength(0);
+  });
+
+  it("requires typed confirmation for repository creation and replays the completed receipt", async () => {
+    const input = {
+      workspaceId: "test",
+      owner: "octo",
+      name: "created-repo",
+      visibility: "private" as const,
+      description: "remote typed repo",
+    };
+
+    const pending = await executor.createRepository(input, {
+      invocationId: "repo-create-initial",
+    });
+    expect(pending).toMatchObject({
+      status: "confirmation_required",
+      operation: "github_create_repository",
+      targetResource: "github:octo/created-repo",
+    });
+    expect(transport.githubApiCalls).toHaveLength(0);
+    if (pending.status !== "confirmation_required") {
+      throw new Error("expected confirmation");
     }
-    expect(transport.commands).toHaveLength(0);
-    expect(transport.execCommands).toHaveLength(0);
+
+    transport.githubApiResults.push(
+      githubResponse({ login: "octo" }),
+      githubResponse(githubRepositoryRecord("octo", "created-repo")),
+    );
+    const confirmedInput = {
+      ...input,
+      confirmationId: pending.confirmationId,
+    };
+    const completed = await executor.createRepository(confirmedInput, {
+      invocationId: "repo-create-confirmed",
+    });
+    expect(completed).toMatchObject({
+      status: "completed",
+      owner: "octo",
+      name: "created-repo",
+    });
+    expect(transport.githubApiCalls).toHaveLength(2);
+
+    const replay = await executor.createRepository(confirmedInput, {
+      invocationId: "repo-create-replay",
+    });
+    expect(replay).toEqual(completed);
+    expect(transport.githubApiCalls).toHaveLength(2);
+  });
+
+  it("requires typed confirmation for PR creation in standard mode", async () => {
+    const input = {
+      workspaceId: "test",
+      owner: "octo",
+      repository: "repo",
+      title: "SSH PR",
+      head: "feature/ssh-github",
+      base: "main",
+      draft: false,
+    };
+
+    const pending = await executor.createPullRequest(input, {
+      invocationId: "pr-create-initial",
+    });
+    expect(pending).toMatchObject({
+      status: "confirmation_required",
+      operation: "github_create_pull_request",
+    });
+    if (pending.status !== "confirmation_required") {
+      throw new Error("expected confirmation");
+    }
+
+    transport.githubApiResults.push(githubResponse(githubPullRequestRecord()));
+    await expect(
+      executor.createPullRequest(
+        { ...input, confirmationId: pending.confirmationId },
+        { invocationId: "pr-create-confirmed" },
+      ),
+    ).resolves.toMatchObject({
+      status: "completed",
+      number: 7,
+      headSha: SHA_C,
+    });
+  });
+
+  it("checks exact PR head before merge and reconciles an ambiguous remote merge", async () => {
+    const input = {
+      workspaceId: "test",
+      owner: "octo",
+      repository: "repo",
+      pullNumber: 7,
+      expectedPullRequestHeadSha: SHA_C,
+      mergeMethod: "squash" as const,
+    };
+
+    const pending = await executor.mergePullRequest(input, {
+      invocationId: "pr-merge-initial",
+    });
+    expect(pending).toMatchObject({
+      status: "confirmation_required",
+      operation: "github_merge_pull_request",
+    });
+    if (pending.status !== "confirmation_required") {
+      throw new Error("expected confirmation");
+    }
+
+    transport.githubApiResults.push(
+      githubResponse(githubPullRequestRecord()),
+      new Error("ambiguous remote transport"),
+      githubResponse(
+        githubPullRequestRecord({
+          state: "closed",
+          merged: true,
+          merge_commit_sha: SHA_D,
+        }),
+      ),
+    );
+
+    await expect(
+      executor.mergePullRequest(
+        { ...input, confirmationId: pending.confirmationId },
+        { invocationId: "pr-merge-confirmed" },
+      ),
+    ).resolves.toEqual({
+      status: "completed",
+      number: 7,
+      merged: true,
+      mergeSha: SHA_D,
+    });
+  });
+
+  it("rejects mismatched typed confirmations before remote GitHub mutation", async () => {
+    const first = await executor.createRepository(
+      {
+        workspaceId: "test",
+        owner: "octo",
+        name: "first-repo",
+        visibility: "private",
+      },
+      { invocationId: "confirm-first" },
+    );
+    if (first.status !== "confirmation_required") {
+      throw new Error("expected confirmation");
+    }
+
+    await expect(
+      executor.createRepository(
+        {
+          workspaceId: "test",
+          owner: "octo",
+          name: "different-repo",
+          visibility: "private",
+          confirmationId: first.confirmationId,
+        },
+        { invocationId: "confirm-mismatch" },
+      ),
+    ).rejects.toMatchObject({ code: "SOURCE_CONTROL_CONFIRMATION_INVALID" });
+    expect(transport.githubApiCalls).toHaveLength(0);
   });
 });
 
